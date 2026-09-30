@@ -18,6 +18,57 @@ from pyogg.opus_encoder import OpusEncoder
 
 from .stream import AsyncByteStream
 
+# ----------------------------------------------------------------------
+# 48 kHz -> 8 kHz decimation filter (Zello always sends 48 kHz Opus;
+# pyogg's set_sampling_frequency() is advisory and does not constrain
+# libopus, so we resample in software).
+#
+# Butterworth low-pass, 6th order, fc = 3400 Hz, fs = 48000 Hz.
+# Biquad cascade in direct form II transposed. Coefficients were derived
+# from scipy.signal.butter(3, 3400/(48000/2), btype='low', output='sos').
+# ----------------------------------------------------------------------
+_LP_SECTIONS = (
+    # (b0, b1, b2, a1, a2) with a0 normalised to 1.0
+    ( 0.04866337,  0.09732674,  0.04866337, -1.25426728,  0.44892075),
+    ( 0.05870370,  0.11740740,  0.05870370, -1.18660190,  0.42141671),
+    ( 0.07554436,  0.15108872,  0.07554436, -1.13041103,  0.43258846),
+)
+
+
+def _resample_48k_to_8k(pcm: bytes) -> bytes:
+    """Decimate little-endian s16 mono PCM by a factor of 6.
+
+    Input must be a whole number of 48 kHz samples (typically 960 per
+    20 ms frame). Output is 1/6 the length, at 8 kHz.
+    """
+    n_in = len(pcm) // 2
+    if n_in == 0:
+        return b''
+    samples = struct.unpack_from('<%dh' % n_in, pcm)
+
+    # Filter state, one (z1, z2) pair per section.
+    if not hasattr(_resample_48k_to_8k, '_state'):
+        _resample_48k_to_8k._state = [[0.0, 0.0] for _ in _LP_SECTIONS]
+    state = _resample_48k_to_8k._state
+
+    out = []
+    for i, x in enumerate(samples):
+        y = float(x)
+        for si, (b0, b1, b2, a1, a2) in enumerate(_LP_SECTIONS):
+            z1, z2 = state[si]
+            w = y - a1 * z1 - a2 * z2
+            y = b0 * w + b1 * z1 + b2 * z2
+            state[si][0] = w
+            state[si][1] = z1
+        if i % 6 == 0:
+            v = int(y)
+            if v > 32767:
+                v = 32767
+            elif v < -32768:
+                v = -32768
+            out.append(v)
+
+    return struct.pack('<%dh' % len(out), *out)
 
 def _env_float(name, default):
     try:
@@ -1061,12 +1112,10 @@ class ZelloController:
         self._last_rx_audio = time.monotonic()
         try:
             pcm = decoder.decode(bytearray(data[9:]))
-            # TEMP DIAGNOSTIC: log the first decoded frame size of each stream.
-            if getattr(self, '_logged_pcm_size_for', None) != self._rx_stream_id:
-                self._logger.warning(
-                    "First decoded PCM frame: %d bytes (stream_id=%s, opus=%d bytes)",
-                    len(pcm), self._rx_stream_id, len(data) - 9)
-                self._logged_pcm_size_for = self._rx_stream_id
+            # pyogg's set_sampling_frequency() is advisory; libopus emits
+            # 48 kHz. Decimate to the 8 kHz the USRP side expects.
+            if len(pcm) == 1920:  # 20 ms @ 48 kHz mono s16
+                pcm = _resample_48k_to_8k(pcm)
             await self._stream_out.write(pcm)
         except Exception as e:
             self._logger.error(f'Failed to decode audio: {e} bytes={len(data)}')
@@ -1170,6 +1219,9 @@ class ZelloController:
             self._last_rx_audio = self._talk_start
             self._rx_stream_id = data.get('stream_id')
             self._reset_decoder()
+            # ADDED: reset resampler state so we don't carry ringing across streams.
+            if hasattr(_resample_48k_to_8k, '_state'):
+                _resample_48k_to_8k._state = [[0.0, 0.0] for _ in _LP_SECTIONS]
             self._logger.debug("Talk user set: %s stream_id=%s", self._talk_user, self._rx_stream_id)
             self._logger.info(f'Keyed:{user}' if user else 'Keyed:Unknown')
             self._zello_ptt.set()
