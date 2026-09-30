@@ -915,9 +915,13 @@ class ZelloController:
                     await self._end_tx()
                     continue
 
+                # PACING FIX: do not re-anchor on lateness. Keep the absolute
+                # schedule so a sustained overrun cannot reset the 20 ms
+                # cadence; snap forward only if we are more than one frame
+                # behind, which avoids a catch-up burst of back-to-back frames.
                 next_tx += PCM_FRAME_SEC
                 now = time.monotonic()
-                if next_tx < now:
+                if now - next_tx > PCM_FRAME_SEC:
                     next_tx = now
         except asyncio.CancelledError:
             self._logger.debug('TX task cancelled')
