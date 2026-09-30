@@ -19,6 +19,45 @@ from pyogg.opus_encoder import OpusEncoder
 from .stream import AsyncByteStream
 
 
+def _resample_48k_to_8k(pcm: bytes) -> bytes:
+    """Decimate little-endian s16 mono PCM by a factor of 6.
+
+    Zello sends 48 kHz Opus; pyogg's set_sampling_frequency() is advisory
+    and libopus ignores it, so the decoder always emits 48 kHz. This
+    function converts 20 ms of 48 kHz audio (1920 bytes / 960 samples)
+    into 20 ms of 8 kHz audio (320 bytes / 160 samples).
+
+    Method: boxcar average over each group of 6 input samples. This is a
+    first-order low-pass with a null at 8 kHz, which suppresses the worst
+    of the aliasing without needing any filter coefficients. No state is
+    kept between calls, so there is nothing to reset on stream boundaries.
+    """
+    n_in = len(pcm) // 2
+    if n_in == 0:
+        return b''
+    if n_in % 6 != 0:
+        # Defensive: trim to a whole number of output samples.
+        n_in -= n_in % 6
+        pcm = pcm[:n_in * 2]
+    if n_in == 0:
+        return b''
+
+    samples = struct.unpack_from('<%dh' % n_in, pcm)
+    n_out = n_in // 6
+    out = [0] * n_out
+    for i in range(n_out):
+        b = i * 6
+        s = (samples[b] + samples[b + 1] + samples[b + 2]
+             + samples[b + 3] + samples[b + 4] + samples[b + 5])
+        v = s // 6
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        out[i] = v
+    return struct.pack('<%dh' % n_out, *out)
+
+
 def _env_float(name, default):
     try:
         return float(os.environ.get(name, default))
