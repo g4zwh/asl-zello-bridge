@@ -329,13 +329,17 @@ class USRPController(asyncio.DatagramProtocol):
 
     @staticmethod
     async def _pace(next_tx):
+        # PACING FIX: keep the absolute schedule when late; snap forward only
+        # if more than one frame behind (avoids a catch-up burst).
         next_tx += USRP_FRAME_TIME
         now = time.monotonic()
         delay = next_tx - now
         if delay > 0:
             await asyncio.sleep(delay)
             return next_tx
-        return now
+        if now - next_tx > USRP_FRAME_TIME:
+            next_tx = now
+        return next_tx
 
     async def _tx_loop(self):
         next_tx = time.monotonic()
