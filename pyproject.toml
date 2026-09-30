@@ -9,7 +9,11 @@ readme = "README.md"
 dependencies = [
     "aiohttp",
     "cryptography",
-    "pyjwt",
+    # [crypto] pulls in the RSA backend (cryptography) needed for RS256
+    # signing of the Zello Free auth token. Without it, PyJWT raises
+    # "Algorithm 'RS256' could not be found" at runtime. We pin >= 2.0
+    # because that is the first release where the extra is required.
+    "pyjwt[crypto]>=2.0",
     "pyogg"
 ]
 
