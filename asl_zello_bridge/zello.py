@@ -1061,6 +1061,12 @@ class ZelloController:
         self._last_rx_audio = time.monotonic()
         try:
             pcm = decoder.decode(bytearray(data[9:]))
+            # TEMP DIAGNOSTIC: log the first decoded frame size of each stream.
+            if getattr(self, '_logged_pcm_size_for', None) != self._rx_stream_id:
+                self._logger.warning(
+                    "First decoded PCM frame: %d bytes (stream_id=%s, opus=%d bytes)",
+                    len(pcm), self._rx_stream_id, len(data) - 9)
+                self._logged_pcm_size_for = self._rx_stream_id
             await self._stream_out.write(pcm)
         except Exception as e:
             self._logger.error(f'Failed to decode audio: {e} bytes={len(data)}')
