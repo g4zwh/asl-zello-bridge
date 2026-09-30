@@ -5,7 +5,6 @@ import os
 import socket
 import struct
 import time
-from array import array
 
 from .stream import AsyncByteStream
 
@@ -16,12 +15,30 @@ USRP_VOICE_SIZE = USRP_FRAME_SIZE - USRP_HEADER_SIZE
 
 USRP_TYPE_VOICE = 0
 
+# chan_usrp is local UDP; three back-to-back unkeys survive a single drop.
+USRP_UNKEY_FRAMES = 3
+USRP_SOCK_BUF = 256 * 1024
+
 
 def _env_float(name, default):
     try:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return float(default)
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 USRP_GAIN_RX_DB = _env_float('USRP_GAIN_RX_DB', 0)
@@ -36,28 +53,28 @@ USRP_GAP_TIMEOUT_SEC = 0.06     # audio gap tolerated while Zello is still sendi
 USRP_HANG_SEC = 0.15            # idle time after Zello stops before un-keying
 USRP_MAX_GAP_FILL_SEC = _env_float('USRP_MAX_GAP_FILL_MS', 2000) / 1000.0
 
+# Drop radio->Zello audio while Zello is talking (ASL duplex=0). Set
+# USRP_HALF_DUPLEX=0 to pass both directions at once.
+USRP_HALF_DUPLEX = _env_bool('USRP_HALF_DUPLEX', True)
+
 
 def db_to_linear(db):
-    # Amplitude (sample) gain: 20*log10.
+    # Amplitude (sample) gain: 20*log10. The original used 10*log10, which is
+    # a *power* ratio and applied double the configured dB to the samples.
     return math.pow(10, db / 20)
 
 
-def apply_gain(buf, gain):
-    # Fast path: no-op gain
-    if gain == 1.0:
-        return buf
+def clamp_short(sh):
+    return int(max(-32768, min(32767, sh)))
 
+
+def apply_gain(buf, gain):
+    """Scale little-endian s16 PCM. Host endianness is ignored on purpose."""
     n = len(buf) // 2
     if n == 0:
         return b''
-
-    # In-place scaling without multi-pass list allocations
-    samples = array('h')
-    samples.frombytes(bytes(buf[:n * 2]))
-    for i in range(len(samples)):
-        s = int(gain * samples[i])
-        samples[i] = -32768 if s < -32768 else (32767 if s > 32767 else s)
-    return samples.tobytes()
+    samples = struct.unpack_from('<%dh' % n, buf)
+    return struct.pack('<%dh' % n, *[clamp_short(gain * s) for s in samples])
 
 
 class USRPController(asyncio.DatagramProtocol):
@@ -78,14 +95,17 @@ class USRPController(asyncio.DatagramProtocol):
 
         self._tx_seq = 0
         self._tx_host = host
-        self._tx_port = int(os.environ.get('USRP_TXPORT', 7070))
+        # README / ASL default is 32001 (not the historical 7070).
+        self._tx_port = _env_int('USRP_TXPORT', 32001)
         self._tx_addr = None  # resolved once in run()
         self._transport = None
+        self._shutdown = False
+        self._unkey_frames = max(1, _env_int('USRP_UNKEY_FRAMES', USRP_UNKEY_FRAMES))
 
         # Optional: only accept datagrams from the resolved USRP_HOST address.
-        self._strict_source = os.environ.get(
-            'USRP_STRICT_SOURCE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        self._strict_source = _env_bool('USRP_STRICT_SOURCE', False)
         self._allowed_sources = set()
+        self._half_duplex = USRP_HALF_DUPLEX
 
         self._usrp_ptt = usrp_ptt
         self._zello_ptt = zello_ptt
@@ -96,17 +116,48 @@ class USRPController(asyncio.DatagramProtocol):
 
         self._logger.info(f'USRP RX gain: {USRP_GAIN_RX_DB}dB = {self._usrp_gain_rx}')
         self._logger.info(f'USRP TX gain: {USRP_GAIN_TX_DB}dB = {self._usrp_gain_tx}')
+        if self._half_duplex:
+            self._logger.info('USRP half-duplex: radio TX ignored while Zello is talking')
+
+    def health(self, now=None):
+        addr = self._tx_addr
+        return {
+            'socket': self._transport is not None,
+            'tx_target': None if addr is None else f'{addr[0]}:{addr[1]}',
+            'radio_keyed': self._usrp_ptt.is_set(),
+            'zello_keyed': self._zello_ptt.is_set(),
+            'buffered': getattr(self._stream_in, 'buffered', None),
+            'dropped': getattr(self._stream_in, 'dropped', 0),
+        }
 
     # ------------------------------------------------------------------
     # Datagram (radio -> Zello) side
     # ------------------------------------------------------------------
     def connection_made(self, transport):
         self._transport = transport
+        sock = transport.get_extra_info('socket')
+        if sock is None:
+            return
+        for opt, val in (
+                (socket.SO_RCVBUF, USRP_SOCK_BUF),
+                (socket.SO_SNDBUF, USRP_SOCK_BUF)):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, opt, val)
+            except OSError:
+                pass
 
     def connection_lost(self, exc):
         if self._ptt_timer is not None:
             self._ptt_timer.cancel()
             self._ptt_timer = None
+        if self._usrp_ptt.is_set():
+            self._usrp_ptt.clear()
+        # Drop the closed transport so _tx() cannot sendto() it.
+        self._transport = None
+        if exc:
+            self._logger.warning('USRP socket lost: %s', exc)
+        else:
+            self._logger.warning('USRP socket closed')
 
     def _ptt_expired(self):
         self._ptt_timer = None
@@ -135,16 +186,27 @@ class USRPController(asyncio.DatagramProtocol):
             self._usrp_ptt.clear()
             return
 
-        self._usrp_ptt.set()
-        self._ptt_timer = asyncio.get_running_loop().call_later(
-            USRP_RX_PTT_TIMEOUT_SEC, self._ptt_expired)
+        # Half-duplex: do not key the Zello TX path while Zello audio is
+        # already going out to the radio (prevents feedback / double-key).
+        if self._half_duplex and self._zello_ptt.is_set():
+            return
 
-        frame = data[USRP_HEADER_SIZE:]
-        frame = frame[:len(frame) & ~1]  # whole 16-bit samples only
+        self._usrp_ptt.set()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            self._ptt_timer = loop.call_later(
+                USRP_RX_PTT_TIMEOUT_SEC, self._ptt_expired)
+
+        # One 20 ms voice payload; extra bytes would burst into Zello.
+        frame = data[USRP_HEADER_SIZE:USRP_HEADER_SIZE + USRP_VOICE_SIZE]
+        frame = frame[:len(frame) & ~1]
         if not frame:
             return
 
-        if self._usrp_gain_rx != 1.0:
+        if self._usrp_gain_rx != 1:
             frame = apply_gain(frame, self._usrp_gain_rx)
 
         self._stream_out.write_nowait(frame)
@@ -157,7 +219,7 @@ class USRPController(asyncio.DatagramProtocol):
         return 'USRP'.encode('ascii') \
             + struct.pack('>iiiiiii',
                           seq, 0,
-                          ptt, 0,
+                          1 if ptt else 0, 0,
                           USRP_TYPE_VOICE, 0, 0)
 
     def _rx_decode_state(self, frame):
@@ -176,17 +238,30 @@ class USRPController(asyncio.DatagramProtocol):
     def _tx_frame(self, pcm):
         header = self._tx_encode_state(ptt=True)
 
-        if self._usrp_gain_tx != 1.0:
+        if self._usrp_gain_tx != 1:
             pcm = apply_gain(pcm, self._usrp_gain_tx)
+
+        if len(pcm) < USRP_VOICE_SIZE:
+            pcm = pcm.ljust(USRP_VOICE_SIZE, b'\x00')
+        elif len(pcm) > USRP_VOICE_SIZE:
+            pcm = pcm[:USRP_VOICE_SIZE]
 
         self._tx(header + pcm)
 
     def _tx_off(self):
-        self._tx(self._tx_encode_state(ptt=False))
+        # Repeat so a single lost UDP packet cannot leave the radio keyed.
+        for _ in range(self._unkey_frames):
+            self._tx(self._tx_encode_state(ptt=False))
 
     def _tx(self, frame):
-        if self._transport is not None and self._tx_addr is not None:
-            self._transport.sendto(frame, self._tx_addr)
+        transport = self._transport
+        addr = self._tx_addr
+        if transport is None or addr is None:
+            return
+        try:
+            transport.sendto(frame, addr)
+        except (OSError, AttributeError) as e:
+            self._logger.warning('USRP send failed: %s', e)
 
     def _clear_input(self):
         clear = getattr(self._stream_in, 'clear', None)
@@ -197,7 +272,7 @@ class USRPController(asyncio.DatagramProtocol):
         """Resolve USRP_HOST once (retrying) instead of on every sendto()."""
         loop = asyncio.get_running_loop()
         delay = 1.0
-        while True:
+        while not self._shutdown:
             family = socket.AF_INET
             sock = self._transport.get_extra_info('socket') if self._transport else None
             if sock is not None:
@@ -219,16 +294,34 @@ class USRPController(asyncio.DatagramProtocol):
     # ------------------------------------------------------------------
     # Zello -> radio side
     # ------------------------------------------------------------------
+    async def shutdown(self):
+        self._shutdown = True
+        try:
+            self._tx_off()
+        except Exception:
+            pass
+        if self._ptt_timer is not None:
+            self._ptt_timer.cancel()
+            self._ptt_timer = None
+        if self._usrp_ptt.is_set():
+            self._usrp_ptt.clear()
+
     async def run(self):
         # rx is handled by DatagramProtocol parent class
         await self._resolve_tx_address()
+        if self._shutdown or self._tx_addr is None:
+            return
         await self.run_tx()
 
     async def run_tx(self):
-        while True:
+        while not self._shutdown:
             try:
                 await self._tx_loop()
             except asyncio.CancelledError:
+                try:
+                    self._tx_off()
+                except Exception:
+                    pass
                 raise
             except Exception:
                 self._logger.exception('USRP TX loop failed; restarting')
@@ -252,17 +345,22 @@ class USRPController(asyncio.DatagramProtocol):
         silence = bytes(USRP_VOICE_SIZE)
 
         try:
-            while True:
+            while not self._shutdown:
                 if not keyed and not buf and not self._zello_ptt.is_set():
                     await self._zello_ptt.wait()
+                    if self._shutdown:
+                        return
                     next_tx = time.monotonic()
                     gap_since = None
 
                 zello_active = self._zello_ptt.is_set()
-                if zello_active and keyed and gap_since is not None:
-                    # Bridging a gap: wake exactly when the next 20 ms frame is
-                    # due so silence goes out in real time.
+                if keyed and zello_active:
+                    # Wake when the next 20 ms frame is due so the first
+                    # missing packet is filled with silence immediately
+                    # (a 60 ms first-gap wait punched a hole in chan_usrp).
                     timeout = max(0.001, next_tx - time.monotonic())
+                elif keyed and not zello_active:
+                    timeout = USRP_HANG_SEC
                 else:
                     timeout = USRP_GAP_TIMEOUT_SEC if zello_active else USRP_HANG_SEC
 
@@ -285,7 +383,6 @@ class USRPController(asyncio.DatagramProtocol):
                             gap_since = now
                         if now - gap_since < USRP_MAX_GAP_FILL_SEC:
                             self._tx_frame(silence)
-                            # The read timeout already waited until next_tx.
                             next_tx += USRP_FRAME_TIME
                             if next_tx <= now:
                                 next_tx = now + USRP_FRAME_TIME

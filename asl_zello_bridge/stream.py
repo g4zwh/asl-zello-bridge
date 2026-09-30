@@ -9,8 +9,6 @@ except AttributeError:  # pragma: no cover - older Python
 class AsyncByteStream:
     """A bounded, single-consumer async byte FIFO.
 
-    Differences from the original implementation:
-
     * The buffer is bounded (``max_bytes``, default 1 s of 8 kHz/16-bit mono).
       When a writer outruns the reader the *oldest* data is discarded, so
       latency can never grow without limit.
@@ -21,6 +19,9 @@ class AsyncByteStream:
       read in ``asyncio.wait_for``. Raises ``asyncio.TimeoutError``.
     * ``clear()`` discards buffered audio (used on PTT edges / when TX cannot
       proceed, so stale audio is never replayed later).
+    * ``dropped`` is a running total of discarded bytes; call
+      ``dropped_since_last_check()`` from a monitor task to log overruns
+      without losing the lifetime counter.
 
     No lock is needed: nothing awaits while the buffer is being mutated.
     """
@@ -32,6 +33,7 @@ class AsyncByteStream:
         self._max = max_bytes & ~1  # keep 16-bit sample alignment
         self._event = asyncio.Event()
         self.dropped = 0  # total bytes discarded because the buffer was full
+        self._dropped_seen = 0
 
     @property
     def buffered(self) -> int:
@@ -56,23 +58,29 @@ class AsyncByteStream:
         self._buf.clear()
         self._event.clear()
 
+    def dropped_since_last_check(self) -> int:
+        """Bytes dropped since the previous call (or since construction)."""
+        n = self.dropped - self._dropped_seen
+        self._dropped_seen = self.dropped
+        return n
+
     async def _wait_for_data(self, timeout):
         if timeout is None:
             while not self._buf:
-                await self._event.wait()
                 self._event.clear()
+                await self._event.wait()
             return
 
         if _asyncio_timeout is not None:
             async with _asyncio_timeout(timeout):
                 while not self._buf:
-                    await self._event.wait()
                     self._event.clear()
+                    await self._event.wait()
         else:  # pragma: no cover - older Python
             async def _wait():
                 while not self._buf:
-                    await self._event.wait()
                     self._event.clear()
+                    await self._event.wait()
             await asyncio.wait_for(_wait(), timeout)
 
     async def read(self, n: int = -1, timeout: float = None) -> bytes:

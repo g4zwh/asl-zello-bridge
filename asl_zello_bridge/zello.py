@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import socket
+import ssl
 import struct
 import jwt
 import time
@@ -40,6 +41,7 @@ RECONNECT_BASE_SEC = 5.0
 RECONNECT_MAX_SEC = 60.0
 RECONNECT_STABLE_SEC = 60.0
 KICK_BACKOFF_SEC = 30.0   # minimum wait after 'kicked' (same account elsewhere?)
+AUTH_FAIL_BACKOFF_SEC = 120.0  # wrong password / unauthorized
 
 # If a Zello stream stops sending audio but never sends on_stream_stop, release
 # the RX-in-progress flag after this long so TX is not blocked forever.
@@ -54,10 +56,17 @@ TX_READ_TIMEOUT_SEC = 1.0
 BACKOFF_RESET_SEC = 30.0
 MAX_UNKNOWN_ERRORS = 5
 
-PTT_IDLE_SLEEP_SEC = 0.003
-MAIN_LOOP_YIELD_SEC = 0.001
-
 PCM_FRAME_BYTES = 320     # 20 ms @ 8 kHz, mono, 16-bit
+PCM_FRAME_SEC = 0.02
+
+_FATAL_CHANNEL_AUTH_ERRORS = frozenset((
+    'invalid password',
+    'not authorized',
+    'invalid token',
+    'unauthorized',
+    'login failed',
+    'invalid credentials',
+))
 
 
 def socket_setup_keepalive(sock):
@@ -76,6 +85,21 @@ def socket_setup_keepalive(sock):
             sock.setsockopt(level, opt, value)
         except Exception:
             pass
+
+
+def _ssl_client_param(verify):
+    """Return an aiohttp SSL argument that still speaks TLS.
+
+    ``TCPConnector(ssl=False)`` is *not* "skip verify" on current aiohttp —
+    it can disable TLS entirely and then ``wss://`` fails. An SSLContext
+    with CERT_NONE is the correct opt-out.
+    """
+    if verify:
+        return True
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 class ZelloController:
@@ -125,9 +149,6 @@ class ZelloController:
 
         self._pkt_id = 0
         self._private_key = None
-        self.load_private_key()
-
-        self._encoder = self._make_encoder()
 
         # All timers below are time.monotonic() values (immune to clock steps).
         self._woodpecker_until = None
@@ -156,9 +177,12 @@ class ZelloController:
 
         self._pending = {}             # seq -> Future awaiting that command's reply
         self._kicked = False
+        self._auth_failed = False
         self._session_authed = False
         self._unknown_errors = 0
         self._last_rx_audio = None
+        self._rx_stream_id = None
+        self._decoder = None
 
         self._stat_start_attempts = 0
         self._stat_start_ok = 0
@@ -167,6 +191,26 @@ class ZelloController:
 
         self._codec_header_b64 = base64.b64encode(
             struct.pack('<hbb', 8000, 1, 20)).decode('utf8')
+
+    def health(self, now=None):
+        now = time.monotonic() if now is None else now
+        last_rx = None if self._last_rx_audio is None else round(now - self._last_rx_audio, 3)
+        return {
+            'logged_in': self._logged_in,
+            'channel_ready': self._channel_ready,
+            'txing': self._txing,
+            'rxing': self._zello_ptt.is_set(),
+            'talk_user': self._talk_user,
+            'last_rx_audio_age_s': last_rx,
+            'start_attempts': self._stat_start_attempts,
+            'start_ok': self._stat_start_ok,
+            'channel_not_ready': self._stat_channel_not_ready,
+            'read_timeouts': self._stat_read_timeouts,
+            'in_buf': getattr(self._stream_in, 'buffered', None),
+            'in_dropped': getattr(self._stream_in, 'dropped', 0),
+            'out_buf': getattr(self._stream_out, 'buffered', None),
+            'out_dropped': getattr(self._stream_out, 'dropped', 0),
+        }
 
     # ------------------------------------------------------------------
     # Setup / auth helpers
@@ -190,19 +234,17 @@ class ZelloController:
         return seq
 
     async def get_token(self):
-        if self._private_key:
+        if self._private_key_path:
             self._logger.info('Private key detected, getting Zello Free token')
+            # RSA signing + key file read: keep it off the event loop.
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, self.get_token_free)
         return None
 
     def load_private_key(self):
         if self._private_key is None and self._private_key_path:
-            try:
-                with open(self._private_key_path, 'rb') as f:
-                    self._private_key = f.read()
-            except Exception as e:
-                self._logger.error(f'Failed to load private key file: {e}')
+            with open(self._private_key_path, 'rb') as f:
+                self._private_key = f.read()
         return self._private_key
 
     def get_token_free(self):
@@ -253,6 +295,8 @@ class ZelloController:
             else:
                 self._logger.info('Authenticating with username/password (Zello Work)')
 
+        # Only mark auth as in progress once the payload is ready to go out, so
+        # a failure above cannot leave the flag dangling.
         self._auth_in_progress = True
         self._auth_started_at = time.monotonic()
         self._auth_seq = payload['seq']
@@ -269,6 +313,7 @@ class ZelloController:
     # Small utilities
     # ------------------------------------------------------------------
     def _debug_skip(self, reason):
+        # De-duplicate on the reason text without its changing countdown.
         key = reason.split(' (')[0]
         now = time.monotonic()
         if (self._last_skip_key != key or self._last_skip_reason_at is None
@@ -343,13 +388,7 @@ class ZelloController:
     def _spawn(self, coro):
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
-
-        def _on_done(t):
-            self._bg_tasks.discard(t)
-            if not t.cancelled() and t.exception():
-                self._logger.error(f"Background task failed: {t.exception()}")
-
-        task.add_done_callback(_on_done)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def _reset_connection_state(self):
         self._ws = None
@@ -366,6 +405,7 @@ class ZelloController:
         self._auth_started_at = None
         self._auth_seq = None
         self._last_rx_audio = None
+        self._rx_stream_id = None
         self._unknown_errors = 0
         self._fail_pending('connection closed')
         if self._zello_ptt.is_set():
@@ -382,18 +422,37 @@ class ZelloController:
             return not self._logged_in
         return False
 
+    def _release_rx(self, reason=None):
+        if reason:
+            self._logger.warning(reason)
+        if self._zello_ptt.is_set():
+            self._zello_ptt.clear()
+        self._talk_user = None
+        self._talk_start = None
+        self._last_rx_audio = None
+        self._rx_stream_id = None
+
     def _check_rx_idle(self, now):
         if not self._zello_ptt.is_set() or self._last_rx_audio is None:
             return
         idle = now - self._last_rx_audio
         if idle > RX_IDLE_TIMEOUT_SEC:
-            self._logger.warning(
+            self._release_rx(
                 f'UnKeyed:{self._talk_user or "Unknown"} (no audio for {idle:.1f}s, '
                 'no stop message; releasing RX)')
-            self._zello_ptt.clear()
-            self._talk_user = None
-            self._talk_start = None
-            self._last_rx_audio = None
+
+    def _log_overruns(self):
+        for stream, name in (
+                (self._stream_in, 'usrp->zello'),
+                (self._stream_out, 'zello->usrp')):
+            fn = getattr(stream, 'dropped_since_last_check', None)
+            if fn is None:
+                continue
+            n = fn()
+            if n:
+                self._logger.warning(
+                    'Audio buffer overrun on %s: dropped %d bytes (%.0f ms)',
+                    name, n, n / 16.0)
 
     async def _maybe_reauth(self, now):
         ws = self._ws
@@ -476,11 +535,13 @@ class ZelloController:
         while not self._shutdown:
             now = time.monotonic()
             if self._check_auth_watchdog(now):
+                # No logon reply at all: the connection is useless, cycle it.
                 ws = self._ws
                 if ws is not None and not ws.closed:
                     self._logger.warning('No logon response; closing connection to retry')
                     await ws.close()
             self._check_rx_idle(now)
+            self._log_overruns()
             await self._maybe_reauth(now)
             await asyncio.sleep(0.5)
 
@@ -542,6 +603,8 @@ class ZelloController:
 
         stream_id = reply.get('stream_id') if reply.get('success') else None
         if stream_id is None:
+            # Error replies (woodpecker, channel not ready, ...) were already
+            # handled by the RX loop; just make sure we don't hammer the server.
             self._logger.debug('start_stream refused: %s', self._redact(reply))
             self._set_retry_after(time.monotonic() + CHANNEL_NOT_READY_BACKOFF_SEC)
             return False
@@ -610,6 +673,18 @@ class ZelloController:
             pass
         return encoder
 
+    def _make_decoder(self):
+        decoder = OpusDecoder()
+        decoder.set_channels(1)
+        decoder.set_sampling_frequency(8000)
+        return decoder
+
+    def _reset_decoder(self):
+        try:
+            self._decoder = self._make_decoder()
+        except Exception:
+            self._logger.exception('Failed to recreate Opus decoder')
+
     async def _read_frame(self, buf, timeout):
         """Return exactly one 20 ms PCM frame (320 bytes) from stream_in.
 
@@ -633,6 +708,7 @@ class ZelloController:
         try:
             opus = encoder.encode(pcm)
         except Exception as e:
+            # Drop this frame but keep the stream (and the task) alive.
             self._logger.error(f'Opus encode failed: {e}')
             return True
         frame = struct.pack('>bii', 1, sid, self._pkt_id) + bytes(opus)
@@ -664,16 +740,18 @@ class ZelloController:
 
     async def run_tx(self):
         self._logger.debug('run_tx starting')
-        encoder = self._encoder
+        encoder = self._make_encoder()
         sending = False
         first_pcm_logged = False
         pcm_buf = bytearray()
         ptt_low_since = None
         last_audio_at = None
+        next_tx = time.monotonic()
         try:
             while not self._shutdown:
                 now = time.monotonic()
 
+                # USRP PTT edge tracking (independent of connection state).
                 ptt = self._usrp_ptt.is_set()
                 if ptt:
                     ptt_low_since = None
@@ -686,6 +764,8 @@ class ZelloController:
                     ptt_low_since = now
 
                 if sending and not self._txing:
+                    # The stream was torn down underneath us (woodpecker,
+                    # reconnect, ...). Don't keep sending on a dead stream id.
                     sending = False
                     first_pcm_logged = False
                     pcm_buf.clear()
@@ -700,8 +780,13 @@ class ZelloController:
                     continue
 
                 if self._in_backoff(now):
+                    # Discard audio rather than replaying it stale afterwards.
                     pcm_buf.clear()
                     self._drain_input()
+                    if sending:
+                        await self._end_tx()
+                        sending = False
+                        first_pcm_logged = False
                     await asyncio.sleep(0.05)
                     continue
 
@@ -709,6 +794,7 @@ class ZelloController:
                     pcm_buf.clear()
                     self._drain_input()
                     first_pcm_logged = False
+                    # Wait for PTT instead of tight polling.
                     try:
                         await asyncio.wait_for(self._usrp_ptt.wait(), timeout=0.2)
                     except asyncio.TimeoutError:
@@ -716,6 +802,9 @@ class ZelloController:
                     continue
 
                 if not ptt:
+                    # PTT dropped but the stream is still open: flush any
+                    # buffered tail audio, then hold for TX_HANG_SEC in case
+                    # PTT comes straight back before closing the stream.
                     try:
                         pcm = await self._read_frame(pcm_buf, timeout=0.02)
                     except asyncio.TimeoutError:
@@ -726,6 +815,8 @@ class ZelloController:
                             first_pcm_logged = False
                             pcm_buf.clear()
                             await self._end_tx()
+                        else:
+                            next_tx = time.monotonic() + PCM_FRAME_SEC
                         continue
                     if ptt_low_since is None or time.monotonic() - ptt_low_since >= TX_HANG_SEC:
                         if pcm_buf:
@@ -738,9 +829,54 @@ class ZelloController:
                         self._drain_input()
                     continue
 
-                if not sending and now - self._ptt_down_at < TX_HOLDOFF_SEC:
+                # ---- PTT is down ----
+                if self._zello_ptt.is_set():
+                    self._debug_skip("RX in progress (zello_ptt set)")
+                    pcm_buf.clear()
+                    self._drain_input()
+                    if sending:
+                        await self._end_tx()
+                        sending = False
+                        first_pcm_logged = False
                     await asyncio.sleep(0.01)
                     continue
+
+                if not sending and self._ptt_down_at is not None and now - self._ptt_down_at < TX_HOLDOFF_SEC:
+                    # Debounce start_stream; discard audio so it is not
+                    # burst-sent the moment the stream opens (woodpecker).
+                    pcm_buf.clear()
+                    self._drain_input()
+                    await asyncio.sleep(0.01)
+                    continue
+
+                reason = self._tx_blocked_reason(now)
+                if reason:
+                    self._debug_skip(reason)
+                    pcm_buf.clear()
+                    self._drain_input()
+                    await asyncio.sleep(0.01)
+                    continue
+
+                if not sending:
+                    if not await self.start_tx() or not self._txing:
+                        self._debug_skip("start_tx failed or no stream_id")
+                        continue
+                    if self._zello_ptt.is_set():
+                        await self._end_tx()
+                        continue
+                    # Fresh encoder state for this stream; drop anything that
+                    # piled up while start_stream was in flight.
+                    encoder = self._make_encoder()
+                    sending = True
+                    first_pcm_logged = False
+                    pcm_buf.clear()
+                    self._drain_input()
+                    next_tx = time.monotonic()
+                    last_audio_at = next_tx
+
+                delay = next_tx - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
                 try:
                     pcm = await self._read_frame(pcm_buf, timeout=0.05)
@@ -757,39 +893,40 @@ class ZelloController:
                             first_pcm_logged = False
                     continue
 
-                now = time.monotonic()
-                last_audio_at = now
+                last_audio_at = time.monotonic()
                 if self._zello_ptt.is_set():
                     self._debug_skip("RX in progress (zello_ptt set)")
-                    continue
-                reason = self._tx_blocked_reason(now)
-                if reason:
-                    self._debug_skip(reason)
+                    pcm_buf.clear()
+                    await self._end_tx()
+                    sending = False
+                    first_pcm_logged = False
                     continue
 
                 if not first_pcm_logged and self._ptt_down_at is not None:
                     self._logger.debug(
                         "First PCM after PTT: %.1f ms",
-                        (now - self._ptt_down_at) * 1000.0)
+                        (last_audio_at - self._ptt_down_at) * 1000.0)
                     first_pcm_logged = True
-
-                if not sending:
-                    if not await self.start_tx() or not self._txing:
-                        self._debug_skip("start_tx failed or no stream_id")
-                        continue
-                    sending = True
 
                 if not await self._send_audio(encoder, pcm):
                     sending = False
                     first_pcm_logged = False
                     pcm_buf.clear()
                     await self._end_tx()
+                    continue
+
+                next_tx += PCM_FRAME_SEC
+                now = time.monotonic()
+                if next_tx < now:
+                    next_tx = now
         except asyncio.CancelledError:
             self._logger.debug('TX task cancelled')
             if sending:
                 await self._end_tx()
             raise
         except Exception:
+            # Let the supervisor log and restart us, but don't leave a
+            # stream open on the server.
             if sending:
                 try:
                     await self._end_tx()
@@ -803,17 +940,16 @@ class ZelloController:
     async def run_rx(self):
         self._logger.debug('run_rx starting')
 
-        decoder = OpusDecoder()
-        decoder.set_channels(1)
-        decoder.set_sampling_frequency(8000)
+        self._decoder = self._make_decoder()
 
         delay = RECONNECT_BASE_SEC
         while not self._shutdown:
             started = time.monotonic()
             self._kicked = False
+            self._auth_failed = False
             self._session_authed = False
             try:
-                await self._run_session(decoder)
+                await self._run_session()
             except asyncio.CancelledError:
                 self._logger.debug('RX task cancelled')
                 raise
@@ -824,28 +960,31 @@ class ZelloController:
             except Exception as e:
                 self._logger.error(f'WebSocket error: {e}')
             finally:
+                kicked = self._kicked
+                auth_failed = self._auth_failed
+                session_authed = self._session_authed
                 self._reset_connection_state()
 
             if self._shutdown:
                 break
 
             uptime = time.monotonic() - started
-            if self._session_authed and uptime >= RECONNECT_STABLE_SEC:
+            if session_authed and uptime >= RECONNECT_STABLE_SEC:
                 delay = RECONNECT_BASE_SEC
             wait = delay
-            if self._kicked:
+            if kicked:
                 wait = max(wait, KICK_BACKOFF_SEC)
+            if auth_failed:
+                wait = max(wait, AUTH_FAIL_BACKOFF_SEC)
             wait *= random.uniform(0.8, 1.2)
             self._logger.info(f'Reconnecting in {wait:.0f}s')
             await asyncio.sleep(wait)
             delay = min(delay * 2, RECONNECT_MAX_SEC)
         self._logger.debug('RX task exiting')
 
-    async def _run_session(self, decoder):
-        kwargs = {'family': socket.AF_INET}
-        if not self._ssl_verify:
-            kwargs['ssl'] = False
-        conn = aiohttp.TCPConnector(**kwargs)
+    async def _run_session(self):
+        ssl_param = _ssl_client_param(self._ssl_verify)
+        conn = aiohttp.TCPConnector(family=socket.AF_INET, ssl=ssl_param)
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
 
         self._logger.info(f"Connecting to {self._zello_ws_endpoint}")
@@ -859,12 +998,13 @@ class ZelloController:
                 async with self._auth_lock:
                     await asyncio.wait_for(self.authenticate(ws), 10)
                 self._ws = ws
-                await self._read_loop(ws, decoder)
+                await self._read_loop(ws)
             finally:
                 if not ws.closed:
                     await ws.close()
 
     def _tune_socket(self, ws):
+        # Relies on aiohttp internals; never let it break the connection.
         try:
             sock = ws._response.connection.transport.get_extra_info('socket')
             if sock is not None:
@@ -872,7 +1012,7 @@ class ZelloController:
         except Exception as e:
             self._logger.debug(f'Could not tune socket: {e}')
 
-    async def _read_loop(self, ws, decoder):
+    async def _read_loop(self, ws):
         start_time = time.monotonic()
         async for msg in ws:
             if self._shutdown:
@@ -881,24 +1021,38 @@ class ZelloController:
                 if not await self._handle_text(msg):
                     return
             elif msg.type == aiohttp.WSMsgType.BINARY:
-                await self._handle_binary(msg, decoder)
+                await self._handle_binary(msg)
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 self._logger.error(f'WebSocket error: {msg.data}')
                 return
             else:
                 self._logger.warning(f'Unhandled message: {msg}')
 
+        # The iterator ends when the peer closes the socket.
         self._logger.warning('Websocket closed!')
         self._logger.debug(
             "WebSocket closed code=%s uptime=%.1fs tx_active=%s channel_ready=%s",
             getattr(ws, 'close_code', None), time.monotonic() - start_time,
             self._txing, self._channel_ready)
 
-    async def _handle_binary(self, msg, decoder):
+    async def _handle_binary(self, msg):
         data = msg.data
         self._logger.debug("RX BINARY %d bytes", len(data))
+        # Audio packet: 1 byte type (0x01), 4 bytes stream id, 4 bytes packet id.
         if len(data) <= 9 or data[0] != 1:
             self._logger.debug("Ignoring non-audio binary message (%d bytes)", len(data))
+            return
+        if not self._zello_ptt.is_set():
+            # Late packets after on_stream_stop (or idle release).
+            return
+        try:
+            _, sid, _pkt = struct.unpack_from('>bii', data, 0)
+        except struct.error:
+            return
+        if self._rx_stream_id is not None and sid != self._rx_stream_id:
+            return
+        decoder = self._decoder
+        if decoder is None:
             return
         self._last_rx_audio = time.monotonic()
         try:
@@ -908,6 +1062,7 @@ class ZelloController:
             self._logger.error(f'Failed to decode audio: {e} bytes={len(data)}')
 
     async def _handle_text(self, msg):
+        """Process a JSON message. Returns False if the connection should be dropped."""
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError as e:
@@ -918,6 +1073,15 @@ class ZelloController:
         if self._logger.isEnabledFor(logging.DEBUG):
             self._logger.debug(f"RX TEXT: {json.dumps(self._redact(data))}")
 
+        # on_channel_status often carries an ``error`` field (invalid password,
+        # offline, ...). Treat it as channel state, not a random WS error.
+        if data.get('command') == 'on_channel_status':
+            self._handle_command(data)
+            err = data.get('error')
+            if err:
+                return self._handle_channel_status_error(err, data)
+            return True
+
         if 'error' in data:
             return await self._handle_error(data)
         if 'command' in data:
@@ -926,10 +1090,26 @@ class ZelloController:
             return self._handle_success(data)
         return True
 
+    def _handle_channel_status_error(self, err_msg, data):
+        err = (err_msg or '').strip().lower()
+        if err in _FATAL_CHANNEL_AUTH_ERRORS:
+            self._logger.error(
+                'Channel auth failed (%s); backing off before reconnect', err_msg)
+            self._auth_failed = True
+            return False
+        self._logger.warning('Channel status error: %s', self._redact(data))
+        return True
+
     async def _handle_error(self, data):
         err_msg = data.get('error')
         seq = data.get('seq')
+        # Wake anyone waiting on this command (e.g. start_tx) straight away.
         self._resolve_pending(seq, data)
+
+        if isinstance(err_msg, str) and err_msg.strip().lower() in _FATAL_CHANNEL_AUTH_ERRORS:
+            self._logger.error('Authentication failed: %s', self._redact(data))
+            self._auth_failed = True
+            return False
 
         if err_msg == 'kicked':
             self._logger.error(f'Kicked from channel: {self._redact(data)}')
@@ -965,7 +1145,9 @@ class ZelloController:
         self._logger.error(f'Server error: {self._redact(data)}')
         if not self._logged_in or (seq is not None and seq == self._auth_seq):
             self._logger.error('Authentication failed')
+            self._auth_failed = True
             return False
+        # Non-fatal per-command error: tolerate a few before reconnecting.
         self._unknown_errors += 1
         return self._unknown_errors < MAX_UNKNOWN_ERRORS
 
@@ -976,7 +1158,9 @@ class ZelloController:
             self._talk_user = user
             self._talk_start = time.monotonic()
             self._last_rx_audio = self._talk_start
-            self._logger.debug("Talk user set: %s", self._talk_user)
+            self._rx_stream_id = data.get('stream_id')
+            self._reset_decoder()
+            self._logger.debug("Talk user set: %s stream_id=%s", self._talk_user, self._rx_stream_id)
             self._logger.info(f'Keyed:{user}' if user else 'Keyed:Unknown')
             self._zello_ptt.set()
         elif cmd == 'on_stream_stop':
@@ -990,10 +1174,13 @@ class ZelloController:
                 self._logger.info(f'UnKeyed:{user}')
             else:
                 self._logger.info('UnKeyed:Unknown')
+            # Keep buffered tail for USRP to flush; drop further binary
+            # packets by clearing the RX-in-progress flag and stream id.
             self._zello_ptt.clear()
             self._talk_user = None
             self._talk_start = None
             self._last_rx_audio = None
+            self._rx_stream_id = None
         elif cmd == 'on_channel_status':
             status = data.get('status')
             desired = (status == 'online')
@@ -1002,8 +1189,12 @@ class ZelloController:
             self._channel_ready = desired
             if desired:
                 self._logger.info("Channel is ready")
+                # Channel status is only ever sent to a logged-in session.
                 if not self._logged_in:
                     self._mark_logged_in()
+            users = data.get('users_online')
+            if users is not None:
+                self._logger.debug('Channel users_online=%s', users)
 
     def _mark_logged_in(self):
         if not self._logged_in:
@@ -1018,6 +1209,8 @@ class ZelloController:
         matched = self._resolve_pending(seq, data)
 
         if ok and 'stream_id' in data and not matched:
+            # Late reply to a start_stream we already gave up on: close it so
+            # the server isn't left with an orphaned open stream.
             sid = data['stream_id']
             if not (self._txing and self._stream_id == sid):
                 self._logger.debug("Closing orphaned stream %s", sid)
@@ -1026,6 +1219,7 @@ class ZelloController:
         is_auth_reply = (self._auth_seq is not None and seq == self._auth_seq)
         if is_auth_reply and not ok:
             self._logger.error(f'Authentication failed: {self._redact(data)}')
+            self._auth_failed = True
             return False
 
         if is_auth_reply:
