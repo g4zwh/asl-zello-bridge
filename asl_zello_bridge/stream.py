@@ -23,7 +23,17 @@ class AsyncByteStream:
       ``dropped_since_last_check()`` from a monitor task to log overruns
       without losing the lifetime counter.
 
-    No lock is needed: nothing awaits while the buffer is being mutated.
+    Wakeup mechanism (fixed):
+      The previous implementation did ``event.clear()`` then
+      ``await event.wait()``. A write landing between those two calls was
+      silently swallowed, causing the reader to block until timeout even
+      though data was available. We now track a monotonic ``_generation``
+      counter: writers bump it, readers snapshot it before checking the
+      buffer, and after waking they re-check ``_buf`` and the generation.
+      No wakeup can be lost regardless of interleaving.
+
+    No lock is needed: nothing awaits while the buffer is being mutated,
+    and ``write_nowait`` is only ever called from the event loop thread.
     """
 
     def __init__(self, max_bytes: int = 16000):
@@ -32,6 +42,7 @@ class AsyncByteStream:
         self._buf = bytearray()
         self._max = max_bytes & ~1  # keep 16-bit sample alignment
         self._event = asyncio.Event()
+        self._generation = 0
         self.dropped = 0  # total bytes discarded because the buffer was full
         self._dropped_seen = 0
 
@@ -48,6 +59,7 @@ class AsyncByteStream:
             excess += excess & 1  # drop whole samples only
             del self._buf[:excess]
             self.dropped += excess
+        self._generation += 1
         self._event.set()
 
     async def write(self, data) -> None:
@@ -56,7 +68,12 @@ class AsyncByteStream:
 
     def clear(self) -> None:
         self._buf.clear()
-        self._event.clear()
+        # Bump the generation so any reader currently parked in
+        # _wait_for_data wakes up, sees an empty buffer, and re-parks.
+        # Without this, clear() could race with a concurrent write and
+        # leave the event set while the buffer is empty.
+        self._generation += 1
+        self._event.set()
 
     def dropped_since_last_check(self) -> int:
         """Bytes dropped since the previous call (or since construction)."""
@@ -65,10 +82,19 @@ class AsyncByteStream:
         return n
 
     async def _wait_for_data(self, timeout):
+        # Snapshot the generation before we look at the buffer: a write
+        # that lands between the snapshot and our first wait will bump the
+        # generation, so we will not miss it.
+        gen = self._generation
+        if self._buf:
+            return
+
         if timeout is None:
             while not self._buf:
                 self._event.clear()
                 await self._event.wait()
+                if self._generation != gen or self._buf:
+                    return
             return
 
         if _asyncio_timeout is not None:
@@ -76,11 +102,15 @@ class AsyncByteStream:
                 while not self._buf:
                     self._event.clear()
                     await self._event.wait()
+                    if self._generation != gen or self._buf:
+                        return
         else:  # pragma: no cover - older Python
             async def _wait():
                 while not self._buf:
                     self._event.clear()
                     await self._event.wait()
+                    if self._generation != gen or self._buf:
+                        return
             await asyncio.wait_for(_wait(), timeout)
 
     async def read(self, n: int = -1, timeout: float = None) -> bytes:

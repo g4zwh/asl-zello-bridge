@@ -1,15 +1,14 @@
 [project]
 name = "asl-zello-bridge"
 version = "0.0.1"
-requires-python = ">= 3.8"
+requires-python = ">= 3.9"
 authors = [
     { name = "Matt G4IYT", email = "matt@g4iyt.uk" }
 ]
 readme = "README.md"
 dependencies = [
     "aiohttp",
-    "cryptography",
-    # [crypto] pulls in the RSA backend (cryptography) needed for RS256
+        # [crypto] pulls in the RSA backend (cryptography) needed for RS256
     # signing of the Zello Free auth token. Without it, PyJWT raises
     # "Algorithm 'RS256' could not be found" at runtime. We pin >= 2.0
     # because that is the first release where the extra is required.
