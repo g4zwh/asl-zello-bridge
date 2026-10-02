@@ -14,6 +14,7 @@ USRP_HEADER_SIZE = 32
 USRP_VOICE_SIZE = USRP_FRAME_SIZE - USRP_HEADER_SIZE
 
 USRP_TYPE_VOICE = 0
+USRP_MAGIC = b'USRP'
 
 # chan_usrp is local UDP; three back-to-back unkeys survive a single drop.
 USRP_UNKEY_FRAMES = 3
@@ -166,7 +167,7 @@ class USRPController(asyncio.DatagramProtocol):
             self._usrp_ptt.clear()
 
     def datagram_received(self, data, addr):
-        if len(data) < USRP_HEADER_SIZE or data[:4] != b'USRP':
+        if len(data) < USRP_HEADER_SIZE or data[:4] != USRP_MAGIC:
             return
         if self._strict_source and addr[0] not in self._allowed_sources:
             return
@@ -216,11 +217,10 @@ class USRPController(asyncio.DatagramProtocol):
     # ------------------------------------------------------------------
     def _tx_encode_state(self, ptt=True):
         seq = self._get_seq()
-        return 'USRP'.encode('ascii') \
-            + struct.pack('>iiiiiii',
-                          seq, 0,
-                          1 if ptt else 0, 0,
-                          USRP_TYPE_VOICE, 0, 0)
+        return USRP_MAGIC + struct.pack('>iiiiiii',
+                                        seq, 0,
+                                        1 if ptt else 0, 0,
+                                        USRP_TYPE_VOICE, 0, 0)
 
     def _rx_decode_state(self, frame):
         header = frame[4:USRP_HEADER_SIZE]
@@ -281,6 +281,8 @@ class USRPController(asyncio.DatagramProtocol):
                 infos = await loop.getaddrinfo(
                     self._tx_host, self._tx_port,
                     family=family, type=socket.SOCK_DGRAM)
+                if not infos:
+                    raise OSError('getaddrinfo returned no results')
                 self._tx_addr = infos[0][4]
                 self._allowed_sources = {info[4][0] for info in infos}
                 self._logger.info(f'USRP TX target: {self._tx_addr}')
@@ -308,10 +310,22 @@ class USRPController(asyncio.DatagramProtocol):
 
     async def run(self):
         # rx is handled by DatagramProtocol parent class
-        await self._resolve_tx_address()
+        try:
+            await self._resolve_tx_address()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                'USRP address resolution failed unexpectedly; TX will not start')
+            return
         if self._shutdown or self._tx_addr is None:
             return
-        await self.run_tx()
+        try:
+            await self.run_tx()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception('USRP run_tx crashed out')
 
     async def run_tx(self):
         while not self._shutdown:

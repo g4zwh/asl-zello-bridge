@@ -19,45 +19,6 @@ from pyogg.opus_encoder import OpusEncoder
 from .stream import AsyncByteStream
 
 
-def _resample_48k_to_8k(pcm: bytes) -> bytes:
-    """Decimate little-endian s16 mono PCM by a factor of 6.
-
-    Zello sends 48 kHz Opus; pyogg's set_sampling_frequency() is advisory
-    and libopus ignores it, so the decoder always emits 48 kHz. This
-    function converts 20 ms of 48 kHz audio (1920 bytes / 960 samples)
-    into 20 ms of 8 kHz audio (320 bytes / 160 samples).
-
-    Method: boxcar average over each group of 6 input samples. This is a
-    first-order low-pass with a null at 8 kHz, which suppresses the worst
-    of the aliasing without needing any filter coefficients. No state is
-    kept between calls, so there is nothing to reset on stream boundaries.
-    """
-    n_in = len(pcm) // 2
-    if n_in == 0:
-        return b''
-    if n_in % 6 != 0:
-        # Defensive: trim to a whole number of output samples.
-        n_in -= n_in % 6
-        pcm = pcm[:n_in * 2]
-    if n_in == 0:
-        return b''
-
-    samples = struct.unpack_from('<%dh' % n_in, pcm)
-    n_out = n_in // 6
-    out = [0] * n_out
-    for i in range(n_out):
-        b = i * 6
-        s = (samples[b] + samples[b + 1] + samples[b + 2]
-             + samples[b + 3] + samples[b + 4] + samples[b + 5])
-        v = s // 6
-        if v > 32767:
-            v = 32767
-        elif v < -32768:
-            v = -32768
-        out[i] = v
-    return struct.pack('<%dh' % n_out, *out)
-
-
 def _env_float(name, default):
     try:
         return float(os.environ.get(name, default))
@@ -179,8 +140,6 @@ class ZelloController:
 
         self._talk_user = None
         self._talk_start = None        # monotonic
-
-        self._usrp_tx_start = None     # monotonic
 
         self._tasks = []
         self._bg_tasks = set()
@@ -362,11 +321,6 @@ class ZelloController:
             self._last_skip_reason_at = now
 
     def _frame_summary_maybe_emit(self):
-        if not self._txing:
-            self._frame_window_start = None
-            self._frame_count = 0
-            self._frame_bytes = 0
-            return
         if self._frame_window_start is None:
             self._frame_window_start = time.monotonic()
             return
@@ -436,7 +390,6 @@ class ZelloController:
         self._txing = False
         self._talk_user = None
         self._talk_start = None
-        self._usrp_tx_start = None
         self._channel_ready = False
         self._auth_in_progress = False
         self._channel_backoff_until = None
@@ -461,9 +414,9 @@ class ZelloController:
             return not self._logged_in
         return False
 
-    def _release_rx(self, reason=None):
+    def _release_rx(self, reason=None, level=logging.WARNING):
         if reason:
-            self._logger.warning(reason)
+            self._logger.log(level, reason)
         if self._zello_ptt.is_set():
             self._zello_ptt.clear()
         self._talk_user = None
@@ -478,7 +431,8 @@ class ZelloController:
         if idle > RX_IDLE_TIMEOUT_SEC:
             self._release_rx(
                 f'UnKeyed:{self._talk_user or "Unknown"} (no audio for {idle:.1f}s, '
-                'no stop message; releasing RX)')
+                'no stop message; releasing RX)',
+                level=logging.INFO)
 
     def _log_overruns(self):
         for stream, name in (
@@ -508,6 +462,8 @@ class ZelloController:
         self._last_reauth_attempt = now
         self._logger.info(f'Access token will expire in {remaining:.0f}s, reauthenticating')
         async with self._auth_lock:
+            if self._auth_in_progress:
+                return
             if self._ws is not None and not self._ws.closed:
                 try:
                     await self.authenticate(self._ws)
@@ -524,8 +480,11 @@ class ZelloController:
                 task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        for task in list(self._bg_tasks):
+        bg = list(self._bg_tasks)
+        for task in bg:
             task.cancel()
+        if bg:
+            await asyncio.gather(*bg, return_exceptions=True)
         self._fail_pending('shutdown')
         if self._ws and not self._ws.closed:
             await self._ws.close()
@@ -618,7 +577,6 @@ class ZelloController:
 
         self._stat_start_attempts += 1
         self._stream_id = None
-        self._usrp_tx_start = now
         seq_val = self.get_seq()
         start_payload = {
             'command': 'start_stream',
@@ -687,7 +645,6 @@ class ZelloController:
                 self._logger.warning('Ending TX but no stream_id available')
         else:
             await self._send_stop(sid)
-        self._usrp_tx_start = None
         self._txing = False
         self._stream_id = None
 
@@ -727,11 +684,15 @@ class ZelloController:
     async def _read_frame(self, buf, timeout):
         """Return exactly one 20 ms PCM frame (320 bytes) from stream_in.
 
-        Partial data is kept in ``buf`` across calls. Raises
+        Partial data is kept in ``buf`` (a bytearray) across calls. Raises
         asyncio.TimeoutError if no more data arrives within ``timeout``.
         """
         while len(buf) < PCM_FRAME_BYTES:
             chunk = await self._stream_in.read(PCM_FRAME_BYTES - len(buf), timeout=timeout)
+            if not chunk:
+                # Stream yielded nothing without raising; treat as a timeout
+                # so callers get the behaviour they already handle.
+                raise asyncio.TimeoutError
             buf += chunk
         frame = bytes(buf[:PCM_FRAME_BYTES])
         del buf[:PCM_FRAME_BYTES]
@@ -743,6 +704,10 @@ class ZelloController:
         if not self._txing or not isinstance(sid, int):
             if self._txing:
                 self._logger.warning(f'Invalid stream_id: {sid}, stopping transmission')
+            return False
+        if self._zello_ptt.is_set():
+            # A Zello RX stream opened while we were about to transmit; drop
+            # this frame rather than colliding with it.
             return False
         try:
             opus = encoder.encode(pcm)
@@ -1100,6 +1065,11 @@ class ZelloController:
         self._last_rx_audio = time.monotonic()
         try:
             pcm = decoder.decode(bytearray(data[9:]))
+            # NOTE: pyogg ignores set_sampling_frequency(8000); the decoder
+            # always emits 48 kHz (1920 bytes per 20 ms frame). This bridge
+            # passes it straight through, and the ASL side plays it at
+            # 48 kHz. Do NOT downsample here — doing so causes the RX audio
+            # to sound chipmunk-fast. Verified empirically, 2026-10.
             await self._stream_out.write(pcm)
         except Exception as e:
             self._logger.error(f'Failed to decode audio: {e} bytes={len(data)}')
@@ -1265,6 +1235,11 @@ class ZelloController:
             self._auth_failed = True
             return False
 
+        if ok:
+            # A working command means the session is healthy again; don't let
+            # a handful of historical errors eventually kill the connection.
+            self._unknown_errors = 0
+
         if is_auth_reply:
             if self._auth_started_at is not None:
                 self._logger.debug(
@@ -1276,21 +1251,18 @@ class ZelloController:
             self._last_login_at = time.monotonic()
             self._start_retry_after = None
             self._mark_logged_in()
-
-        if ok and 'refresh_token' in data:
-            self._logger.info('Authentication successful!')
-            self._refresh_token = data['refresh_token']
-            self._auth_in_progress = False
-            self._auth_started_at = None
-            self._auth_seq = None
-            self._last_login_at = time.monotonic()
-            self._start_retry_after = None
-            self._mark_logged_in()
-            try:
-                exp = jwt.decode(self._refresh_token, options={"verify_signature": False}).get('exp')
-                if exp:
-                    self._token_expiry = datetime.fromtimestamp(exp, tz=timezone.utc)
-                    self._logger.debug("Refresh token expiry set to %s", self._token_expiry)
-            except Exception as e:
-                self._logger.debug(f'Failed to decode refresh token expiry: {e}')
+            if ok:
+                self._logger.info('Authentication successful!')
+            if ok and 'refresh_token' in data:
+                self._refresh_token = data['refresh_token']
+                try:
+                    exp = jwt.decode(
+                        self._refresh_token,
+                        options={"verify_signature": False}).get('exp')
+                    if exp:
+                        self._token_expiry = datetime.fromtimestamp(exp, tz=timezone.utc)
+                        self._logger.debug(
+                            "Refresh token expiry set to %s", self._token_expiry)
+                except Exception as e:
+                    self._logger.debug(f'Failed to decode refresh token expiry: {e}')
         return True
