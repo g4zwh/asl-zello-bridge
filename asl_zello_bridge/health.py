@@ -27,7 +27,14 @@ def build_payload(zello, usrp):
     now = time.monotonic()
     zello_health = zello.health(now) if hasattr(zello, 'health') else {}
     usrp_health = usrp.health(now) if hasattr(usrp, 'health') else {}
-    ok = bool(zello_health.get('logged_in') and zello_health.get('channel_ready'))
+    # The bridge is only useful when BOTH legs are up: a live Zello session
+    # cannot carry audio if the USRP socket/target is gone, and vice versa.
+    ok = bool(
+        zello_health.get('logged_in')
+        and zello_health.get('channel_ready')
+        and usrp_health.get('socket')
+        and usrp_health.get('tx_target')
+    )
     return {
         'ok': ok,
         'zello': zello_health,

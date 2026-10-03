@@ -82,10 +82,9 @@ class AsyncByteStream:
         return n
 
     async def _wait_for_data(self, timeout):
-        # Snapshot the generation before we look at the buffer: a write
-        # that lands between the snapshot and our first wait will bump the
-        # generation, so we will not miss it.
-        gen = self._generation
+        # The event is only ever set by write_nowait()/clear(), both of
+        # which are called from the event loop thread with no await in
+        # between, so there is no window in which a wakeup can be lost.
         if self._buf:
             return
 
@@ -93,7 +92,11 @@ class AsyncByteStream:
             while not self._buf:
                 self._event.clear()
                 await self._event.wait()
-                if self._generation != gen or self._buf:
+                # Only a generation bump that actually produced data (or a
+                # buffer that is now non-empty) ends the wait. A bare
+                # clear() bump means "keep waiting"; returning here would
+                # let read() hand back an empty bytes object.
+                if self._buf:
                     return
             return
 
@@ -102,14 +105,14 @@ class AsyncByteStream:
                 while not self._buf:
                     self._event.clear()
                     await self._event.wait()
-                    if self._generation != gen or self._buf:
+                    if self._buf:
                         return
         else:  # pragma: no cover - older Python
             async def _wait():
                 while not self._buf:
                     self._event.clear()
                     await self._event.wait()
-                    if self._generation != gen or self._buf:
+                    if self._buf:
                         return
             await asyncio.wait_for(_wait(), timeout)
 
