@@ -151,6 +151,12 @@ class USRPController(asyncio.DatagramProtocol):
                 sock.setsockopt(socket.SOL_SOCKET, opt, val)
             except OSError:
                 pass
+        
+        # Mark outgoing packets with DSCP Expedited Forwarding (EF / 46 = 0xB8)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0xB8)
+        except OSError:
+            pass
 
     def connection_lost(self, exc):
         if self._ptt_timer is not None:
@@ -363,7 +369,7 @@ class USRPController(asyncio.DatagramProtocol):
 
     async def _tx_loop(self):
         next_tx = time.monotonic()
-        buf = b''
+        buf = bytearray()
         keyed = False
         gap_since = None
         silence = bytes(USRP_VOICE_SIZE)
@@ -393,8 +399,8 @@ class USRPController(asyncio.DatagramProtocol):
                         USRP_VOICE_SIZE - len(buf), timeout=timeout)
                 except asyncio.TimeoutError:
                     if buf:
-                        self._tx_frame(buf.ljust(USRP_VOICE_SIZE, b'\x00'))
-                        buf = b''
+                        self._tx_frame(bytes(buf).ljust(USRP_VOICE_SIZE, b'\x00'))
+                        buf.clear()
                         keyed = True
                         next_tx = await self._pace(next_tx)
 
@@ -407,9 +413,7 @@ class USRPController(asyncio.DatagramProtocol):
                             gap_since = now
                         if now - gap_since < USRP_MAX_GAP_FILL_SEC:
                             self._tx_frame(silence)
-                            next_tx += USRP_FRAME_TIME
-                            if next_tx <= now:
-                                next_tx = now + USRP_FRAME_TIME
+                            next_tx = await self._pace(next_tx)
                             continue
 
                     # End of transmission.
@@ -423,7 +427,8 @@ class USRPController(asyncio.DatagramProtocol):
 
                 if not chunk:
                     continue
-                buf += chunk
+
+                buf.extend(chunk)
                 gap_since = None
 
                 if len(buf) < USRP_VOICE_SIZE:
@@ -438,7 +443,8 @@ class USRPController(asyncio.DatagramProtocol):
                         await asyncio.sleep(0.005)
                     next_tx = time.monotonic()
 
-                pcm, buf = buf[:USRP_VOICE_SIZE], buf[USRP_VOICE_SIZE:]
+                pcm = bytes(buf[:USRP_VOICE_SIZE])
+                del buf[:USRP_VOICE_SIZE]
                 self._tx_frame(pcm)
                 keyed = True
                 next_tx = await self._pace(next_tx)

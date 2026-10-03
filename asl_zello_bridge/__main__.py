@@ -69,12 +69,7 @@ async def _main():
             health_srv = await start_health_server(
                 zello, usrp, HEALTH_BIND, HEALTH_PORT)
         except Exception:
-            logger.exception('Health server failed to start; shutting down')
-            try:
-                transport.close()
-            except Exception:
-                pass
-            raise
+            logger.exception('Health server failed to start; continuing without it')
 
     tasks = [
         asyncio.create_task(zello.run(), name='zello'),
