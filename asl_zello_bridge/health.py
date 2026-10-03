@@ -54,9 +54,14 @@ async def start_health_server(zello, usrp, host=None, port=None):
     async def _handle(reader, writer):
         status = 200
         try:
-            await reader.read(1024)
+            try:
+                req = await asyncio.wait_for(reader.read(1024), 2.0)
+            except asyncio.TimeoutError:
+                req = b''   # client sent nothing; answer anyway
             payload = build_payload(zello, usrp)
-            status = 200 if payload.get('ok') else 503
+            # GET /live = "process and event loop are alive": always 200.
+            live_only = req.startswith(b'GET /live')
+            status = 200 if (live_only or payload.get('ok')) else 503
             body = json.dumps(payload, default=str).encode('utf-8')
         except Exception:
             logger.exception('Health handler failed')

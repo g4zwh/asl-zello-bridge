@@ -59,6 +59,30 @@ MAX_UNKNOWN_ERRORS = 5
 PCM_FRAME_BYTES = 320     # 20 ms @ 8 kHz, mono, 16-bit
 PCM_FRAME_SEC = 0.02
 
+# Decimation factor applied to the Opus decoder output before it reaches
+# USRP voice frames. On this host pyogg honours set_sampling_frequency(8000)
+# and emits 8 kHz directly, so 1 (pass-through) is correct and decimation
+# is a no-op.
+#
+# Kept as a tunable because pyogg builds differ: some silently ignore the
+# requested rate and emit at 16, 24 or 48 kHz. Symptoms and values:
+#
+#   chipmunk-fast audio → decoder emitting too high → set 2, 3 or 6
+#   slow / dragging audio → decoder emitting too low → set 1
+#
+#   ZELLO_DECODE_DECIMATE=1   # decoder already at 8 kHz
+#   ZELLO_DECODE_DECIMATE=2   # 16 kHz -> 8 kHz
+#   ZELLO_DECODE_DECIMATE=3   # 24 kHz -> 8 kHz
+#   ZELLO_DECODE_DECIMATE=6   # 48 kHz -> 8 kHz
+#
+# If you need to diagnose a new pyogg build, log len(pcm) right after
+# decoder.decode(); sample_rate = bytes / 2 / packet_duration_seconds, and
+# the correct factor is that rate divided by 8000.
+try:
+    ZELLO_DECODE_DECIMATE = max(1, int(os.environ.get('ZELLO_DECODE_DECIMATE', '1')))
+except ValueError:
+    ZELLO_DECODE_DECIMATE = 1
+
 _FATAL_CHANNEL_AUTH_ERRORS = frozenset((
     'invalid password',
     'not authorized',
@@ -181,6 +205,10 @@ class ZelloController:
         self._last_rx_audio = None
         self._rx_stream_id = None
         self._decoder = None
+
+        self._throttle = {}             # key -> (last logged, suppressed count)
+        self._abandoned_starts = set()  # seqs of start_stream calls we gave up on
+        self._tx_task = None
 
         self._stat_start_attempts = 0
         self._stat_start_ok = 0
@@ -346,6 +374,18 @@ class ZelloController:
         self._backoff_state[kind] = (count, now)
         return min(cap, base * (2 ** (count - 1)))
 
+    def _log_throttled(self, key, level, msg, *args, interval=5.0):
+        """Log at most once per ``interval`` s per key (for per-packet paths)."""
+        now = time.monotonic()
+        last, suppressed = self._throttle.get(key, (None, 0))
+        if last is not None and now - last < interval:
+            self._throttle[key] = (last, suppressed + 1)
+            return
+        if suppressed:
+            msg += ' (%d similar suppressed)' % suppressed
+        self._throttle[key] = (now, 0)
+        self._logger.log(level, msg, *args)
+
     def _drain_input(self):
         clear = getattr(self._stream_in, 'clear', None)
         if clear is not None:
@@ -434,6 +474,13 @@ class ZelloController:
                 'no stop message; releasing RX)',
                 level=logging.INFO)
 
+    # Both directions are 8 kHz mono s16 (16 B/ms) once the Zello->radio
+    # side is decimated to match USRP voice frames.
+    _MS_PER_BYTE = {
+        'usrp->zello': 16.0,
+        'zello->usrp': 16.0,
+    }
+
     def _log_overruns(self):
         for stream, name in (
                 (self._stream_in, 'usrp->zello'),
@@ -443,9 +490,10 @@ class ZelloController:
                 continue
             n = fn()
             if n:
+                bytes_per_ms = self._MS_PER_BYTE.get(name, 16.0)
                 self._logger.warning(
-                    'Audio buffer overrun on %s: dropped %d bytes (%.0f ms)',
-                    name, n, n / 16.0)
+                    'Audio buffer overrun on %s: dropped %d bytes (%.1f ms)',
+                    name, n, n / bytes_per_ms)
 
     async def _maybe_reauth(self, now):
         ws = self._ws
@@ -475,6 +523,12 @@ class ZelloController:
     # ------------------------------------------------------------------
     async def shutdown(self):
         self._shutdown = True
+        # Stop TX first: its CancelledError handler sends stop_stream, which
+        # needs the websocket (owned by the RX task) to still be open.
+        tx = self._tx_task
+        if tx is not None and not tx.done():
+            tx.cancel()
+            await asyncio.gather(tx, return_exceptions=True)
         for task in self._tasks:
             if not task.done():
                 task.cancel()
@@ -515,10 +569,11 @@ class ZelloController:
 
     async def run(self):
         try:
+            self._tx_task = asyncio.create_task(self._supervise('tx', self.run_tx))
             self._tasks = [
                 asyncio.create_task(self._supervise('rx', self.run_rx)),
                 asyncio.create_task(self._supervise('monitor', self.monitor)),
-                asyncio.create_task(self._supervise('tx', self.run_tx))
+                self._tx_task
             ]
             await asyncio.gather(*self._tasks)
         except asyncio.CancelledError:
@@ -592,6 +647,11 @@ class ZelloController:
             reply = await self._send_command(start_payload, START_STREAM_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             self._logger.error('Failed to get stream_id within timeout')
+            # Remember this seq so a late success reply can be recognised
+            # (and the orphaned stream closed) in _handle_success.
+            self._abandoned_starts.add(seq_val)
+            if len(self._abandoned_starts) > 16:
+                self._abandoned_starts.clear()
             self._set_retry_after(time.monotonic() + CHANNEL_NOT_READY_BACKOFF_SEC)
             return False
         except Exception as e:
@@ -809,6 +869,9 @@ class ZelloController:
                     # PTT dropped but the stream is still open: flush any
                     # buffered tail audio, then hold for TX_HANG_SEC in case
                     # PTT comes straight back before closing the stream.
+                    delay = next_tx - time.monotonic()
+                    if delay > 0:
+                        await asyncio.sleep(delay)   # pace the tail flush
                     try:
                         pcm = await self._read_frame(pcm_buf, timeout=0.02)
                     except asyncio.TimeoutError:
@@ -998,7 +1061,7 @@ class ZelloController:
         self._logger.info(f"Connecting to {self._zello_ws_endpoint}")
         async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
             ws = await asyncio.wait_for(
-                session.ws_connect(self._zello_ws_endpoint, autoping=True, heartbeat=30.0),
+                session.ws_connect(self._zello_ws_endpoint, autoping=True, heartbeat=15.0),
                 20)
             try:
                 self._logger.debug("WebSocket connection established")
@@ -1045,7 +1108,6 @@ class ZelloController:
 
     async def _handle_binary(self, msg):
         data = msg.data
-        self._logger.debug("RX BINARY %d bytes", len(data))
         # Audio packet: 1 byte type (0x01), 4 bytes stream id, 4 bytes packet id.
         if len(data) <= 9 or data[0] != 1:
             self._logger.debug("Ignoring non-audio binary message (%d bytes)", len(data))
@@ -1058,6 +1120,10 @@ class ZelloController:
         except struct.error:
             return
         if self._rx_stream_id is not None and sid != self._rx_stream_id:
+            self._log_throttled(
+                'drop_sid', logging.WARNING,
+                "Dropping packet: sid=%s does not match rx_stream_id=%s",
+                sid, self._rx_stream_id)
             return
         decoder = self._decoder
         if decoder is None:
@@ -1065,14 +1131,23 @@ class ZelloController:
         self._last_rx_audio = time.monotonic()
         try:
             pcm = decoder.decode(bytearray(data[9:]))
-            # NOTE: pyogg ignores set_sampling_frequency(8000); the decoder
-            # always emits 48 kHz (1920 bytes per 20 ms frame). This bridge
-            # passes it straight through, and the ASL side plays it at
-            # 48 kHz. Do NOT downsample here — doing so causes the RX audio
-            # to sound chipmunk-fast. Verified empirically, 2026-10.
+
+            # Decimate the decoder output to 8 kHz if the pyogg build in
+            # use does not honour set_sampling_frequency. On this host the
+            # decoder already emits 8 kHz, so the factor is 1 and this
+            # block is a no-op. See the module-level constant for symptoms
+            # and other values.
+            if ZELLO_DECODE_DECIMATE > 1:
+                n_samples = len(pcm) // 2
+                if n_samples:
+                    samples = struct.unpack_from('<%dh' % n_samples, pcm)
+                    decimated = samples[::ZELLO_DECODE_DECIMATE]
+                    pcm = struct.pack('<%dh' % len(decimated), *decimated)
             await self._stream_out.write(pcm)
         except Exception as e:
-            self._logger.error(f'Failed to decode audio: {e} bytes={len(data)}')
+            self._log_throttled(
+                'decode', logging.ERROR,
+                'Failed to decode audio: %s bytes=%d', e, len(data))
 
     async def _handle_text(self, msg):
         """Process a JSON message. Returns False if the connection should be dropped."""
@@ -1117,7 +1192,7 @@ class ZelloController:
         err_msg = data.get('error')
         seq = data.get('seq')
         # Wake anyone waiting on this command (e.g. start_tx) straight away.
-        self._resolve_pending(seq, data)
+        matched = self._resolve_pending(seq, data)
 
         if isinstance(err_msg, str) and err_msg.strip().lower() in _FATAL_CHANNEL_AUTH_ERRORS:
             self._logger.error('Authentication failed: %s', self._redact(data))
@@ -1160,6 +1235,10 @@ class ZelloController:
             self._logger.error('Authentication failed')
             self._auth_failed = True
             return False
+        if matched:
+            # The awaiting caller (e.g. start_tx) handles its own failure;
+            # a refused TX must not tear down the RX connection.
+            return True
         # Non-fatal per-command error: tolerate a few before reconnecting.
         self._unknown_errors += 1
         return self._unknown_errors < MAX_UNKNOWN_ERRORS
@@ -1177,6 +1256,11 @@ class ZelloController:
             self._logger.info(f'Keyed:{user}' if user else 'Keyed:Unknown')
             self._zello_ptt.set()
         elif cmd == 'on_stream_stop':
+            sid = data.get('stream_id')
+            if (sid is not None and self._rx_stream_id is not None
+                    and sid != self._rx_stream_id):
+                self._logger.debug('Ignoring stop for stale stream %s', sid)
+                return
             dur = None
             if self._talk_start is not None:
                 dur = time.monotonic() - self._talk_start
@@ -1221,7 +1305,8 @@ class ZelloController:
         ok = bool(data.get('success'))
         matched = self._resolve_pending(seq, data)
 
-        if ok and 'stream_id' in data and not matched:
+        if ok and 'stream_id' in data and not matched and seq in self._abandoned_starts:
+            self._abandoned_starts.discard(seq)
             # Late reply to a start_stream we already gave up on: close it so
             # the server isn't left with an orphaned open stream.
             sid = data['stream_id']

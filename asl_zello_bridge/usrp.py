@@ -58,6 +58,11 @@ USRP_MAX_GAP_FILL_SEC = _env_float('USRP_MAX_GAP_FILL_MS', 2000) / 1000.0
 # USRP_HALF_DUPLEX=0 to pass both directions at once.
 USRP_HALF_DUPLEX = _env_bool('USRP_HALF_DUPLEX', True)
 
+# Jitter buffer: wait for this much Zello audio before keying the radio.
+# 0 disables it. Costs this much extra latency on Zello -> radio.
+USRP_PREBUFFER_SEC = _env_float('USRP_PREBUFFER_MS', 60) / 1000.0
+USRP_PREBUFFER_MAX_SEC = 0.15   # never hold the first frame longer than this
+
 
 def db_to_linear(db):
     # Amplitude (sample) gain: 20*log10. The original used 10*log10, which is
@@ -190,6 +195,7 @@ class USRPController(asyncio.DatagramProtocol):
         # Half-duplex: do not key the Zello TX path while Zello audio is
         # already going out to the radio (prevents feedback / double-key).
         if self._half_duplex and self._zello_ptt.is_set():
+            self._usrp_ptt.clear()   # no timer is armed on this path
             return
 
         self._usrp_ptt.set()
@@ -422,6 +428,15 @@ class USRPController(asyncio.DatagramProtocol):
 
                 if len(buf) < USRP_VOICE_SIZE:
                     continue
+
+                if not keyed and USRP_PREBUFFER_SEC > 0:
+                    need = int(USRP_PREBUFFER_SEC * 16000)   # 8 kHz s16 = 16 B/ms
+                    deadline = time.monotonic() + USRP_PREBUFFER_MAX_SEC
+                    while (len(buf) + self._stream_in.buffered < need
+                           and self._zello_ptt.is_set()
+                           and time.monotonic() < deadline):
+                        await asyncio.sleep(0.005)
+                    next_tx = time.monotonic()
 
                 pcm, buf = buf[:USRP_VOICE_SIZE], buf[USRP_VOICE_SIZE:]
                 self._tx_frame(pcm)
