@@ -24,10 +24,16 @@ def _env_int(name, default):
 async def _main():
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
+    stop_signals = [0]
 
     def _request_stop():
-        logger.info('Shutdown requested')
-        stop.set()
+        stop_signals[0] += 1
+        if stop_signals[0] == 1:
+            logger.info('Shutdown requested (signal again to force)')
+            stop.set()
+        else:
+            logger.warning('Second signal received; forcing exit')
+            raise SystemExit(1)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -57,11 +63,18 @@ async def _main():
         lambda: usrp,
         local_addr=(bind, rxport))
 
-    health_port = HEALTH_PORT
     health_srv = None
-    if health_port:
-        health_srv = await start_health_server(
-            zello, usrp, HEALTH_BIND, health_port)
+    if HEALTH_PORT:
+        try:
+            health_srv = await start_health_server(
+                zello, usrp, HEALTH_BIND, HEALTH_PORT)
+        except Exception:
+            logger.exception('Health server failed to start; shutting down')
+            try:
+                transport.close()
+            except Exception:
+                pass
+            raise
 
     tasks = [
         asyncio.create_task(zello.run(), name='zello'),
@@ -70,14 +83,21 @@ async def _main():
     ]
 
     try:
-        done, pending = await asyncio.wait(
+        done, _pending = await asyncio.wait(
             tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             if task.get_name() == 'stop':
                 continue
-            exc = task.exception() if not task.cancelled() else None
+            if task.cancelled():
+                logger.warning('Task %s was cancelled', task.get_name())
+                continue
+            exc = task.exception()
             if exc is not None:
                 logger.error('Task %s failed: %s', task.get_name(), exc)
+            else:
+                logger.warning(
+                    'Task %s exited without error; shutting down',
+                    task.get_name())
     finally:
         logger.info('Shutting down')
         try:
@@ -108,7 +128,9 @@ def main():
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
-        pass
+        # add_signal_handler normally catches this; this path only fires on
+        # platforms where it raised NotImplementedError.
+        logger.info('Interrupted')
 
 
 if __name__ == '__main__':
