@@ -68,7 +68,13 @@ RX_IMPLICIT_START = True
 # within this window, re-assert RX instead of dropping the tail end of a
 # transmission. Lets RX_IDLE_TIMEOUT_SEC be short without risking a cut
 # mid-sentence on a long pause.
-RX_REASSERT_SEC = _env_float('ZELLO_RX_REASSERT_SEC', 1.5)
+RX_REASSERT_SEC = _env_float('ZELLO_RX_REASSERT_SEC', 6.0)
+
+# Hard ceiling on the pre-speech / no-audio state. If on_stream_start fires
+# but no audio ever arrives (dead key, or the server sends start without
+# audio), release after this long. Without this, a stuck start would block
+# the ASL->Zello path until the WebSocket reconnects.
+RX_STUCK_SEC = _env_float('ZELLO_RX_STUCK_SEC', 30.0)
 TX_READ_TIMEOUT_SEC = 1.0
 BACKOFF_RESET_SEC = 30.0
 MAX_UNKNOWN_ERRORS = 5
@@ -217,6 +223,12 @@ class ZelloController:
         self._recent_rx_released_at = None
         # For adaptive TX holdoff.
         self._last_ptt_up_at = None
+        # True once at least one binary packet has been received in the
+        # current transmission. Lets _check_rx_idle distinguish the
+        # pre-speech pause (user keyed up, hasn't spoken yet) from a
+        # genuine mid-over stall, so the pre-speech pause doesn't trip
+        # the idle timeout.
+        self._rx_audio_seen = False
 
         self._throttle = {}             # key -> (last logged, suppressed count)
         self._abandoned_starts = set()  # seqs of start_stream calls we gave up on
@@ -475,6 +487,7 @@ class ZelloController:
         # transmission resumes shortly, _handle_binary can re-assert RX.
         self._recent_rx_stream_id = self._rx_stream_id
         self._recent_rx_released_at = time.monotonic()
+        self._rx_audio_seen = False
         self._talk_user = None
         self._talk_start = None
         self._last_rx_audio = None
@@ -482,6 +495,18 @@ class ZelloController:
 
     def _check_rx_idle(self, now):
         if not self._zello_ptt.is_set() or self._last_rx_audio is None:
+            return
+        if not self._rx_audio_seen:
+            # User has keyed up but not spoken yet. Allow them time to
+            # start, but cap the total wait so a dead key (or a spurious
+            # on_stream_start with no audio) can't wedge RX forever.
+            if (self._talk_start is not None
+                    and now - self._talk_start > RX_STUCK_SEC):
+                self._release_rx(
+                    f'UnKeyed:{self._talk_user or "Unknown"} '
+                    f'(no audio at all in {now - self._talk_start:.1f}s; '
+                    'releasing RX)',
+                    level=logging.WARNING)
             return
         idle = now - self._last_rx_audio
         if idle > RX_IDLE_TIMEOUT_SEC:
@@ -1198,6 +1223,7 @@ class ZelloController:
         if decoder is None:
             return
         self._last_rx_audio = time.monotonic()
+        self._rx_audio_seen = True
         try:
             pcm = decoder.decode(bytearray(data[9:]))
 
@@ -1320,9 +1346,11 @@ class ZelloController:
             self._talk_start = time.monotonic()
             self._last_rx_audio = self._talk_start
             self._rx_stream_id = data.get('stream_id')
-            # Fresh transmission: any pending re-assert window is now stale.
+            # Fresh transmission: any pending re-assert window is now
+            # stale, and no audio has been seen yet for this transmission.
             self._recent_rx_stream_id = None
             self._recent_rx_released_at = None
+            self._rx_audio_seen = False
             self._reset_decoder()
             self._logger.debug("Talk user set: %s stream_id=%s", self._talk_user, self._rx_stream_id)
             self._logger.info(f'Keyed:{user}' if user else 'Keyed:Unknown')
@@ -1350,6 +1378,7 @@ class ZelloController:
             # not trigger an implicit-start.
             self._recent_rx_stream_id = self._rx_stream_id
             self._recent_rx_released_at = time.monotonic()
+            self._rx_audio_seen = False
             self._talk_user = None
             self._talk_start = None
             self._last_rx_audio = None
