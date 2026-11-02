@@ -81,8 +81,7 @@ class AsyncByteStream:
             while not self._buf:
                 self._event.clear()
                 await self._event.wait()
-                # Only a generation bump that actually produced data (or a
-                # buffer that is now non-empty) ends the wait. A bare
+                # Only a buffer that is now non-empty ends the wait. A bare
                 # clear() bump means "keep waiting"; returning here would
                 # let read() hand back an empty bytes object.
                 if self._buf:

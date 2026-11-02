@@ -39,7 +39,7 @@ START_STREAM_TIMEOUT_SEC = 2.0
 # has stayed up (and logged in) for RECONNECT_STABLE_SEC.
 RECONNECT_BASE_SEC = 5.0
 RECONNECT_MAX_SEC = 60.0
-RECONNECT_STABLE_SEC = 60.0
+RECONNECT_STABLE_SEC = 30.0
 KICK_BACKOFF_SEC = 30.0   # minimum wait after 'kicked' (same account elsewhere?)
 AUTH_FAIL_BACKOFF_SEC = 120.0  # wrong password / unauthorized
 
@@ -51,7 +51,24 @@ RX_IDLE_TIMEOUT_SEC = _env_float('ZELLO_RX_IDLE_TIMEOUT_SEC', 2.0)
 # PTT returns). Prevents squelch flutter causing rapid start/stop cycles that
 # trigger 'woodpecker prohibited'.
 TX_HANG_SEC = _env_float('ZELLO_TX_HANG_MS', 400) / 1000.0
-TX_HOLDOFF_SEC = 0.15     # debounce before opening a new stream
+
+# Adaptive TX holdoff: fast on a fresh key, conservative if PTT has just
+# bounced (protects against squelch flutter / woodpecker).
+TX_HOLDOFF_FRESH_SEC = _env_float('ZELLO_TX_HOLDOFF_FRESH_MS', 30) / 1000.0
+TX_HOLDOFF_FLUTTER_SEC = _env_float('ZELLO_TX_HOLDOFF_FLUTTER_MS', 150) / 1000.0
+TX_FLUTTER_WINDOW_SEC = 0.5   # if PTT was released more recently than this, treat as bounce
+
+# If audio arrives for a stream that has no live zello_ptt state (missed
+# on_stream_start after a reconnect, or the server sent on_stream_stop
+# prematurely), treat it as an implicit start rather than dropping it.
+# Only for a stream id we haven't just closed — no replaying stale audio.
+RX_IMPLICIT_START = True
+
+# If the idle timeout fires but audio from the same Zello stream resumes
+# within this window, re-assert RX instead of dropping the tail end of a
+# transmission. Lets RX_IDLE_TIMEOUT_SEC be short without risking a cut
+# mid-sentence on a long pause.
+RX_REASSERT_SEC = _env_float('ZELLO_RX_REASSERT_SEC', 1.5)
 TX_READ_TIMEOUT_SEC = 1.0
 BACKOFF_RESET_SEC = 30.0
 MAX_UNKNOWN_ERRORS = 5
@@ -61,23 +78,12 @@ PCM_FRAME_SEC = 0.02
 
 # Decimation factor applied to the Opus decoder output before it reaches
 # USRP voice frames. On this host pyogg honours set_sampling_frequency(8000)
-# and emits 8 kHz directly, so 1 (pass-through) is correct and decimation
-# is a no-op.
+# and emits 8 kHz directly, so 1 (pass-through) is correct.
 #
-# Kept as a tunable because pyogg builds differ: some silently ignore the
-# requested rate and emit at 16, 24 or 48 kHz. Symptoms and values:
-#
-#   chipmunk-fast audio → decoder emitting too high → set 2, 3 or 6
-#   slow / dragging audio → decoder emitting too low → set 1
-#
-#   ZELLO_DECODE_DECIMATE=1   # decoder already at 8 kHz
-#   ZELLO_DECODE_DECIMATE=2   # 16 kHz -> 8 kHz
-#   ZELLO_DECODE_DECIMATE=3   # 24 kHz -> 8 kHz
-#   ZELLO_DECODE_DECIMATE=6   # 48 kHz -> 8 kHz
-#
-# If you need to diagnose a new pyogg build, log len(pcm) right after
-# decoder.decode(); sample_rate = bytes / 2 / packet_duration_seconds, and
-# the correct factor is that rate divided by 8000.
+#   1 = pass-through (decoder already at 8 kHz)   <-- this host
+#   2 = 16 kHz → 8 kHz
+#   3 = 24 kHz → 8 kHz
+#   6 = 48 kHz → 8 kHz
 try:
     ZELLO_DECODE_DECIMATE = max(1, int(os.environ.get('ZELLO_DECODE_DECIMATE', '1')))
 except ValueError:
@@ -205,6 +211,12 @@ class ZelloController:
         self._last_rx_audio = None
         self._rx_stream_id = None
         self._decoder = None
+        # Preserved across _release_rx for the re-assert / implicit-start
+        # paths in _handle_binary.
+        self._recent_rx_stream_id = None
+        self._recent_rx_released_at = None
+        # For adaptive TX holdoff.
+        self._last_ptt_up_at = None
 
         self._throttle = {}             # key -> (last logged, suppressed count)
         self._abandoned_starts = set()  # seqs of start_stream calls we gave up on
@@ -459,6 +471,10 @@ class ZelloController:
             self._logger.log(level, reason)
         if self._zello_ptt.is_set():
             self._zello_ptt.clear()
+        # Preserve the stream id and release time so that if the same
+        # transmission resumes shortly, _handle_binary can re-assert RX.
+        self._recent_rx_stream_id = self._rx_stream_id
+        self._recent_rx_released_at = time.monotonic()
         self._talk_user = None
         self._talk_start = None
         self._last_rx_audio = None
@@ -596,7 +612,10 @@ class ZelloController:
             self._check_rx_idle(now)
             self._log_overruns()
             await self._maybe_reauth(now)
-            await asyncio.sleep(0.5)
+            # Poll fast while a Zello RX is in progress so an idle timeout
+            # fires within ~50 ms of its deadline, not at the next 0.5 s
+            # tick. When nothing is incoming, 0.5 s is plenty.
+            await asyncio.sleep(0.05 if self._zello_ptt.is_set() else 0.5)
 
     # ------------------------------------------------------------------
     # TX (radio -> Zello)
@@ -826,6 +845,7 @@ class ZelloController:
                     self._logger.info(f'UnKeyed:USRP ({now - self._ptt_down_at:.1f}s)')
                     self._ptt_down_at = None
                     ptt_low_since = now
+                    self._last_ptt_up_at = now
 
                 if sending and not self._txing:
                     # The stream was torn down underneath us (woodpecker,
@@ -908,13 +928,21 @@ class ZelloController:
                     await asyncio.sleep(0.01)
                     continue
 
-                if not sending and self._ptt_down_at is not None and now - self._ptt_down_at < TX_HOLDOFF_SEC:
-                    # Debounce start_stream; discard audio so it is not
-                    # burst-sent the moment the stream opens (woodpecker).
-                    pcm_buf.clear()
-                    self._drain_input()
-                    await asyncio.sleep(0.01)
-                    continue
+                if not sending and self._ptt_down_at is not None:
+                    # Adaptive holdoff: short on a fresh key, longer if PTT
+                    # has just bounced (protects against woodpecker).
+                    if (self._last_ptt_up_at is not None
+                            and now - self._last_ptt_up_at < TX_FLUTTER_WINDOW_SEC):
+                        holdoff = TX_HOLDOFF_FLUTTER_SEC
+                    else:
+                        holdoff = TX_HOLDOFF_FRESH_SEC
+                    if now - self._ptt_down_at < holdoff:
+                        # Debounce start_stream; discard audio so it is not
+                        # burst-sent the moment the stream opens (woodpecker).
+                        pcm_buf.clear()
+                        self._drain_input()
+                        await asyncio.sleep(0.01)
+                        continue
 
                 reason = self._tx_blocked_reason(now)
                 if reason:
@@ -1112,13 +1140,54 @@ class ZelloController:
         if len(data) <= 9 or data[0] != 1:
             self._logger.debug("Ignoring non-audio binary message (%d bytes)", len(data))
             return
-        if not self._zello_ptt.is_set():
-            # Late packets after on_stream_stop (or idle release).
-            return
         try:
             _, sid, _pkt = struct.unpack_from('>bii', data, 0)
         except struct.error:
             return
+        if not self._zello_ptt.is_set():
+            now = time.monotonic()
+            # Re-assert case: same stream, released within RX_REASSERT_SEC.
+            # A speaker who paused mid-over tripped the idle timeout; the
+            # audio resuming means the over is still live.
+            if (self._recent_rx_stream_id == sid
+                    and self._recent_rx_released_at is not None
+                    and now - self._recent_rx_released_at < RX_REASSERT_SEC):
+                self._logger.info(
+                    'RX resumed on stream %s within %.2fs; re-keying',
+                    sid, now - self._recent_rx_released_at)
+                self._talk_start = now
+                self._last_rx_audio = now
+                self._rx_stream_id = sid
+                self._recent_rx_stream_id = None
+                self._recent_rx_released_at = None
+                self._reset_decoder()
+                self._zello_ptt.set()
+            elif RX_IMPLICIT_START and self._logged_in:
+                # Implicit start: no on_stream_start seen (usually a
+                # reconnect) or the server sent on_stream_stop prematurely.
+                if self._recent_rx_stream_id == sid:
+                    self._logger.debug(
+                        'Ignoring late audio for finished stream %s', sid)
+                    return
+                self._logger.warning(
+                    'Implicit RX start on stream %s (no on_stream_start)', sid)
+                self._talk_user = None
+                self._talk_start = now
+                self._last_rx_audio = now
+                self._rx_stream_id = sid
+                self._reset_decoder()
+                self._zello_ptt.set()
+            else:
+                # Dropping audio for a stream we have no state for. Logged
+                # once per stream id (via _dropped_sid_log) so we know it
+                # happened without flooding the journal.
+                if getattr(self, '_dropped_sid_log', None) != sid:
+                    self._logger.warning(
+                        'Dropping audio for stream %s (no on_stream_start '
+                        'received; zello_ptt is clear)', sid)
+                    self._dropped_sid_log = sid
+                return
+            self._dropped_sid_log = None
         if self._rx_stream_id is not None and sid != self._rx_stream_id:
             self._log_throttled(
                 'drop_sid', logging.WARNING,
@@ -1251,6 +1320,9 @@ class ZelloController:
             self._talk_start = time.monotonic()
             self._last_rx_audio = self._talk_start
             self._rx_stream_id = data.get('stream_id')
+            # Fresh transmission: any pending re-assert window is now stale.
+            self._recent_rx_stream_id = None
+            self._recent_rx_released_at = None
             self._reset_decoder()
             self._logger.debug("Talk user set: %s stream_id=%s", self._talk_user, self._rx_stream_id)
             self._logger.info(f'Keyed:{user}' if user else 'Keyed:Unknown')
@@ -1274,6 +1346,10 @@ class ZelloController:
             # Keep buffered tail for USRP to flush; drop further binary
             # packets by clearing the RX-in-progress flag and stream id.
             self._zello_ptt.clear()
+            # Remember which stream just ended so late audio for it does
+            # not trigger an implicit-start.
+            self._recent_rx_stream_id = self._rx_stream_id
+            self._recent_rx_released_at = time.monotonic()
             self._talk_user = None
             self._talk_start = None
             self._last_rx_audio = None

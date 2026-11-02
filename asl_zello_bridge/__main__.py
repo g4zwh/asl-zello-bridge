@@ -43,8 +43,15 @@ async def _main():
             pass
 
     # Names match the data direction so the wiring is obvious.
-    usrp_to_zello = AsyncByteStream()  # radio PCM → Zello TX
-    zello_to_usrp = AsyncByteStream()  # Zello PCM → radio TX
+    # Zello audio arrives over WebSocket (TCP), which means several Opus
+    # packets can land in one burst when the socket drains. Each packet is
+    # up to 1920 bytes (~120 ms of 8 kHz PCM), and we've seen bursts of
+    # ~9 packets (~1.1 s) after a stall. The 1 s default cap is too tight
+    # for that and caused audible drops after ~15 s of continuous speech.
+    # 3 s of headroom eliminates the overruns; the buffer drains
+    # continuously so steady-state latency is unaffected.
+    usrp_to_zello = AsyncByteStream(max_bytes=16000)  # radio PCM → Zello TX (1 s)
+    zello_to_usrp = AsyncByteStream(max_bytes=48000)  # Zello PCM → radio TX (3 s)
 
     usrp_ptt = asyncio.Event()
     zello_ptt = asyncio.Event()
