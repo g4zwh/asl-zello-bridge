@@ -111,7 +111,15 @@ class AsyncByteStream:
         if ``timeout`` (seconds) elapses first.
         """
         if not self._buf:
-            await self._wait_for_data(timeout)
+            try:
+                await self._wait_for_data(timeout)
+            except asyncio.TimeoutError:
+                # Data can land in the same loop iteration in which the
+                # timeout fires. If audio is actually there, return it rather
+                # than reporting a timeout (callers such as the USRP TX loop
+                # clear the buffer on timeout and would throw it away).
+                if not self._buf:
+                    raise
         size = len(self._buf) if (n is None or n < 0) else min(n, len(self._buf))
         data = bytes(self._buf[:size])
         del self._buf[:size]

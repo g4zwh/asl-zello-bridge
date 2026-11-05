@@ -210,6 +210,7 @@ class ZelloController:
         self._last_reauth_attempt = None
 
         self._pending = {}             # seq -> Future awaiting that command's reply
+        self._auth_used_refresh = False  # last logon was sent with a refresh token
         self._kicked = False
         self._auth_failed = False
         self._session_authed = False
@@ -347,6 +348,7 @@ class ZelloController:
 
         # Only mark auth as in progress once the payload is ready to go out, so
         # a failure above cannot leave the flag dangling.
+        self._auth_used_refresh = used_refresh
         self._auth_in_progress = True
         self._auth_started_at = time.monotonic()
         self._auth_seq = payload['seq']
@@ -540,7 +542,8 @@ class ZelloController:
         ws = self._ws
         if ws is None or ws.closed or self._token_expiry is None or not self._logged_in:
             return
-        if self._auth_in_progress or self._txing or self._usrp_ptt.is_set():
+        if (self._auth_in_progress or self._txing or self._usrp_ptt.is_set()
+                or self._zello_ptt.is_set()):
             return
         remaining = (self._token_expiry - datetime.now(timezone.utc)).total_seconds()
         if remaining > AUTH_TOKEN_EXPIRY_THRESHOLD:
@@ -550,14 +553,24 @@ class ZelloController:
             return
         self._last_reauth_attempt = now
         self._logger.info(f'Access token will expire in {remaining:.0f}s, reauthenticating')
+        # Own task: a stalled send must never block the monitor loop, which
+        # also owns the RX idle timeout that releases the radio.
+        self._spawn(self._do_reauth())
+
+    async def _do_reauth(self):
         async with self._auth_lock:
-            if self._auth_in_progress:
+            # Re-check under the lock: the radio may have keyed meanwhile.
+            if (self._auth_in_progress or self._txing or self._usrp_ptt.is_set()
+                    or self._zello_ptt.is_set()):
+                self._last_reauth_attempt = None   # try again on the next tick
                 return
-            if self._ws is not None and not self._ws.closed:
-                try:
-                    await self.authenticate(self._ws)
-                except Exception as e:
-                    self._logger.error(f'Reauthentication failed: {e}')
+            ws = self._ws
+            if ws is None or ws.closed:
+                return
+            try:
+                await asyncio.wait_for(self.authenticate(ws), 10)
+            except Exception as e:
+                self._logger.error(f'Reauthentication failed: {e!r}')
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -633,7 +646,7 @@ class ZelloController:
                 ws = self._ws
                 if ws is not None and not ws.closed:
                     self._logger.warning('No logon response; closing connection to retry')
-                    await ws.close()
+                    self._spawn(ws.close())   # a close handshake can take 10 s
             self._check_rx_idle(now)
             self._log_overruns()
             await self._maybe_reauth(now)
@@ -743,14 +756,19 @@ class ZelloController:
             self._logger.error(f'Failed to send stop_stream: {e}')
 
     async def _end_tx(self):
+        # Clear the state *before* awaiting. _end_tx is called from both the
+        # TX task and the websocket read loop (woodpecker / empty message).
+        # Clearing afterwards let both callers pass the sid check and send two
+        # stop_streams, and left _txing True while the stop was in flight.
         sid = self._stream_id
-        if sid is None:
-            if self._txing:
-                self._logger.warning('Ending TX but no stream_id available')
-        else:
-            await self._send_stop(sid)
+        was_txing = self._txing
         self._txing = False
         self._stream_id = None
+        if sid is None:
+            if was_txing:
+                self._logger.warning('Ending TX but no stream_id available')
+            return
+        await self._send_stop(sid)
 
     def _make_encoder(self):
         encoder = OpusEncoder()
@@ -827,7 +845,10 @@ class ZelloController:
         try:
             await ws.send_bytes(frame)
         except Exception as e:
-            self._logger.error(f'Failed to send audio frame: {e}')
+            self._logger.error(f'Failed to start stream: {e!r}')
+            # Without a retry window run_tx calls straight back in, and a send
+            # that raises immediately never yields to the event loop.
+            self._set_retry_after(time.monotonic() + CHANNEL_NOT_READY_BACKOFF_SEC)
             return False
         self._frame_count += 1
         self._frame_bytes += len(opus)
@@ -980,6 +1001,7 @@ class ZelloController:
                 if not sending:
                     if not await self.start_tx() or not self._txing:
                         self._debug_skip("start_tx failed or no stream_id")
+                        await asyncio.sleep(0.01)   # always yield
                         continue
                     if self._zello_ptt.is_set():
                         await self._end_tx()
@@ -1087,6 +1109,7 @@ class ZelloController:
                 kicked = self._kicked
                 auth_failed = self._auth_failed
                 session_authed = self._session_authed
+                used_refresh = self._auth_used_refresh
                 self._reset_connection_state()
 
             if self._shutdown:
@@ -1098,7 +1121,12 @@ class ZelloController:
             wait = delay
             if kicked:
                 wait = max(wait, KICK_BACKOFF_SEC)
-            if auth_failed:
+            # Only a failed *first* logon with real credentials earns the long
+            # penalty. A rejected refresh token, or a failed re-auth on a
+            # session that had been logged in, is not a credentials problem:
+            # retry soon. The refresh token is already consumed, so the next
+            # logon is a fresh one.
+            if auth_failed and not session_authed and not used_refresh:
                 wait = max(wait, AUTH_FAIL_BACKOFF_SEC)
             wait *= random.uniform(0.8, 1.2)
             self._logger.info(f'Reconnecting in {wait:.0f}s')
@@ -1445,14 +1473,22 @@ class ZelloController:
                 self._logger.info('Authentication successful!')
             if ok and 'refresh_token' in data:
                 self._refresh_token = data['refresh_token']
+                expiry = None
                 try:
                     exp = jwt.decode(
                         self._refresh_token,
                         options={"verify_signature": False}).get('exp')
                     if exp:
-                        self._token_expiry = datetime.fromtimestamp(exp, tz=timezone.utc)
+                        expiry = datetime.fromtimestamp(exp, tz=timezone.utc)
                         self._logger.debug(
-                            "Refresh token expiry set to %s", self._token_expiry)
+                            "Refresh token expiry set to %s", expiry)
                 except Exception as e:
                     self._logger.debug(f'Failed to decode refresh token expiry: {e}')
+                if expiry is None or expiry <= datetime.now(timezone.utc):
+                    # Opaque or undated refresh token: assume the usual token
+                    # lifetime. Leaving a stale expiry in place would make
+                    # _maybe_reauth log on again every REAUTH_MIN_INTERVAL_SEC.
+                    expiry = datetime.now(timezone.utc) + timedelta(
+                        seconds=AUTH_TOKEN_EXPIRY)
+                self._token_expiry = expiry
         return True
