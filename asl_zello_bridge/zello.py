@@ -76,6 +76,10 @@ RX_REASSERT_SEC = _env_float('ZELLO_RX_REASSERT_SEC', 6.0)
 # the ASL->Zello path until the WebSocket reconnects.
 RX_STUCK_SEC = _env_float('ZELLO_RX_STUCK_SEC', 30.0)
 TX_READ_TIMEOUT_SEC = 1.0
+# Radio -> Zello time-out timer. If the radio stays keyed this long (stuck
+# squelch, noisy carrier) release the Zello stream and ignore PTT until the
+# radio un-keys, so the channel cannot be held indefinitely. 0 disables.
+TX_MAX_SEC = _env_float('ZELLO_TX_MAX_SEC', 300)
 BACKOFF_RESET_SEC = 30.0
 MAX_UNKNOWN_ERRORS = 5
 
@@ -875,6 +879,8 @@ class ZelloController:
         pcm_buf = bytearray()
         ptt_low_since = None
         last_audio_at = None
+        tot_lockout = False      # True once TX_MAX_SEC tripped; cleared when PTT drops
+        tx_started_at = None
         next_tx = time.monotonic()
         try:
             while not self._shutdown:
@@ -892,6 +898,8 @@ class ZelloController:
                     self._ptt_down_at = None
                     ptt_low_since = now
                     self._last_ptt_up_at = now
+                if not ptt:
+                    tot_lockout = False
 
                 if sending and not self._txing:
                     # The stream was torn down underneath us (woodpecker,
@@ -974,6 +982,24 @@ class ZelloController:
                     await asyncio.sleep(0.01)
                     continue
 
+                if tot_lockout:
+                    # Past the time-out: ignore the radio until it un-keys.
+                    pcm_buf.clear()
+                    self._drain_input()
+                    await asyncio.sleep(0.05)
+                    continue
+                if (sending and TX_MAX_SEC > 0 and tx_started_at is not None
+                        and now - tx_started_at > TX_MAX_SEC):
+                    self._logger.warning(
+                        'TX time-out after %.0fs: radio still keyed; releasing '
+                        'Zello stream until PTT drops', now - tx_started_at)
+                    tot_lockout = True
+                    pcm_buf.clear()
+                    await self._end_tx()
+                    sending = False
+                    first_pcm_logged = False
+                    continue
+
                 if not sending and self._ptt_down_at is not None:
                     # Adaptive holdoff: short on a fresh key, longer if PTT
                     # has just bounced (protects against woodpecker).
@@ -1015,6 +1041,7 @@ class ZelloController:
                     self._drain_input()
                     next_tx = time.monotonic()
                     last_audio_at = next_tx
+                    tx_started_at = next_tx
 
                 delay = next_tx - time.monotonic()
                 if delay > 0:
