@@ -2,24 +2,39 @@
 
 This tool allows Zello Free or Zello Work channels to be connected to USRP, enabling bridging of amateur radio networks to the Zello network.
 
-Tested with:
+_Edit: This is a branch from the creator, Matt G4IYT. I use this bridge on a daily basis and am using AI to address issues that I find in the code. I am not a coder!
 
-* [AllStarLink](https://www.allstarlink.org/) `chan_usrp`
-* [DVSwitch](https://dvswitch.groups.io/g/main?) `Analog_Bridge`
-* [MMDVM\_CM](https://github.com/juribeparada/MMDVM_CM) `USRP2DMR` and `USRP2YSF`
-* [SvxLink](https://www.svxlink.org/) via a third-party USRP module
+New features have been added. You will need to add extra lines to the systemmd file:
 
-The original inspiration for this project was the work done by [Rob G4ZWH](https://www.qrz.com/db/G4ZWH) to build a public Zello bridge to the [FreeSTAR](https://freestar.network/) network using SIP softphones and the Zello Windows client. This was well received but had limitations. [Matt G4IYT](https://www.qrz.com/db/G4IYT) later rebuilt the bridge as a dedicated service using the [Zello Channels API](https://github.com/zelloptt/zello-channel-api/blob/master/API.md).
+### Reliability settings
 
-Current users of the bridge include:
+All of these are environment variables. Unless noted, the defaults keep the previous behaviour.
 
-* [FreeSTAR](https://freestar.network)
-* [CumbriaCQ.com](https://cumbriacq.com/)
-* [235 Alive](https://235alive.com)
+| Variable | Default | What it does |
+|---|---|---|
+| `ZELLO_TX_MAX_SEC` | `300` | Radio → Zello time-out. If the radio stays keyed this long (stuck squelch, noisy carrier), the Zello stream is released and PTT is ignored until the radio un-keys. `0` disables. |
+| `ZELLO_RX_MAX_SEC` | `300` | Zello → radio time-out. If one Zello transmission runs this long (e.g. a stuck mic), the radio is released and the rest of that stream is ignored. Other users' streams are unaffected. `0` disables. |
+| `ZELLO_WS_HEARTBEAT_SEC` | `15` | WebSocket ping interval. A dead link is detected after about 1.5× this value. `5` is a good value for a mission-critical setup. |
+| `ZELLO_RECONNECT_BASE_SEC` | `5` | First reconnect delay after a drop; later retries back off as before. `2` gives faster recovery. |
+| `ZELLO_LOGIN_WEDGE_EXIT_SEC` | `0` (off) | If not logged in to Zello for this long, exit cleanly so the service manager can restart the bridge. **Only enable with `Restart=always`** (the exit code is 0). |
+| `USRP_PREKEY_MS` | `0` (off) | RF key-up lead-in: key the radio and send this much silence before the first word of a Zello transmission, so the transmitter, repeater and listeners' squelch are open. Adds the same latency. Try `200` and tune on air. |
 
-The bridge does not require significant resources. The FreeSTAR bridge runs on a VPS with 1 VCPU and 1GB RAM, and performs well on both AMD64 and ARM platforms.
+**Behaviour note:** the start of each radio over is no longer discarded while the Zello stream opens. The over reaches Zello about one round trip later instead of with its first ~200 ms missing.
 
----
+**Suggested systemd settings:**
+
+```ini
+[Service]
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+```
+---_
+
+
+
+
+
 
 ## Table of Contents
 
