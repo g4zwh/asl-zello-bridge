@@ -1,6 +1,6 @@
 # AllStarLink ⇔ Zello Bridge
 
-** Edit: This is a branch from the creator, Matt G4IYT. I use this bridge on a daily basis and am using AI to address issues that I find in the code. I am not a coder! **
+## ** Edit: This is a branch from the creator, Matt G4IYT. I use this bridge on a daily basis and am using AI to address issues that I find in the code. I am not a coder! **
 
 This tool allows Zello Free or Zello Work channels to be connected to USRP, enabling bridging of amateur radio networks to the Zello network.
 
@@ -21,7 +21,7 @@ All of these are environment variables. Unless noted, the defaults keep the prev
 
 **Behaviour note:** the start of each radio over is no longer discarded while the Zello stream opens. The over reaches Zello about one round trip later instead of with its first ~200 ms missing.
 
-# Suggested systemd settings:
+Suggested systemd settings:
 
 ```ini
 [Service]
