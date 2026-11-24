@@ -6,7 +6,7 @@ This tool allows Zello Free or Zello Work channels to be connected to USRP, enab
 
 New features have been added. You will need to add extra lines to the systemmd file:
 
-### Reliability settings
+# Reliability settings
 
 All of these are environment variables. Unless noted, the defaults keep the previous behaviour.
 
@@ -21,7 +21,7 @@ All of these are environment variables. Unless noted, the defaults keep the prev
 
 **Behaviour note:** the start of each radio over is no longer discarded while the Zello stream opens. The over reaches Zello about one round trip later instead of with its first ~200 ms missing.
 
-**Suggested systemd settings:**
+# Suggested systemd settings:
 
 ```ini
 [Service]
@@ -31,33 +31,33 @@ StartLimitIntervalSec=0
 ```
 ---_
 
-SUGGESTED responsive profile:
+#SUGGESTED responsive profile:
 
-# --- Reliability settings (responsive profile) ---
+--- Reliability settings (responsive profile) ---
 
-# Dead Zello link noticed in ~7.5 s instead of ~22 s
+Dead Zello link noticed in ~7.5 s instead of ~22 s
 ZELLO_WS_HEARTBEAT_SEC=5
 
-# First reconnect after a drop (later retries still back off)
+First reconnect after a drop (later retries still back off)
 ZELLO_RECONNECT_BASE_SEC=2
 
-# Release the Zello stream if the radio stays keyed this long (stuck squelch)
+Release the Zello stream if the radio stays keyed this long (stuck squelch)
 ZELLO_TX_MAX_SEC=300
 
-# Release the radio if one Zello transmission runs this long (stuck mic)
+Release the radio if one Zello transmission runs this long (stuck mic)
 ZELLO_RX_MAX_SEC=300
 
-# RF key-up lead-in: silence sent before the first word of a Zello transmission.
-# Start at 200 and tune on air.
+RF key-up lead-in: silence sent before the first word of a Zello transmission.
+Start at 200 and tune on air.
 USRP_PREKEY_MS=200
 
-# Health endpoint for monitoring (loopback only). Any free port will do.
+Health endpoint for monitoring (loopback only). Any free port will do.
 HEALTH_BIND=127.0.0.1
 HEALTH_PORT=8099
 
-# Self-heal: exit if not logged in to Zello for 5 minutes so systemd restarts us.
-# UNCOMMENT ONLY AFTER the unit has Restart=always, otherwise the bridge will
-# stay down after a long outage.
+Self-heal: exit if not logged in to Zello for 5 minutes so systemd restarts us.
+UNCOMMENT ONLY AFTER the unit has Restart=always, otherwise the bridge will
+stay down after a long outage.
 #ZELLO_LOGIN_WEDGE_EXIT_SEC=300
 
 
