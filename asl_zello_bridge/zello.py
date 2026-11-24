@@ -37,7 +37,7 @@ START_STREAM_TIMEOUT_SEC = 2.0
 
 # Reconnect policy: exponential backoff with jitter, reset once a connection
 # has stayed up (and logged in) for RECONNECT_STABLE_SEC.
-RECONNECT_BASE_SEC = 5.0
+RECONNECT_BASE_SEC = _env_float('ZELLO_RECONNECT_BASE_SEC', 5.0)
 RECONNECT_MAX_SEC = 60.0
 RECONNECT_STABLE_SEC = 30.0
 KICK_BACKOFF_SEC = 30.0   # minimum wait after 'kicked' (same account elsewhere?)
@@ -75,6 +75,19 @@ RX_REASSERT_SEC = _env_float('ZELLO_RX_REASSERT_SEC', 6.0)
 # audio), release after this long. Without this, a stuck start would block
 # the ASL->Zello path until the WebSocket reconnects.
 RX_STUCK_SEC = _env_float('ZELLO_RX_STUCK_SEC', 30.0)
+
+# Hard cap on ONE continuous Zello transmission. A stuck PTT / open mic on a
+# Zello client would otherwise hold the radio keyed (and, in half-duplex, block
+# all radio->Zello traffic) until the Zello user lets go. 0 disables.
+RX_MAX_SEC = _env_float('ZELLO_RX_MAX_SEC', 300)
+
+# WebSocket ping interval. A dead link is detected after about 1.5x this.
+WS_HEARTBEAT_SEC = _env_float('ZELLO_WS_HEARTBEAT_SEC', 15.0)
+
+# If we have not been logged in to Zello for this long, exit cleanly so the
+# service manager (systemd Restart=always) gives us a fresh process. 0 disables
+# (the default); set e.g. 300 only once the service is set to Restart=always.
+LOGIN_WEDGE_EXIT_SEC = _env_float('ZELLO_LOGIN_WEDGE_EXIT_SEC', 0)
 TX_READ_TIMEOUT_SEC = 1.0
 # Radio -> Zello time-out timer. If the radio stays keyed this long (stuck
 # squelch, noisy carrier) release the Zello stream and ignore PTT until the
@@ -236,6 +249,8 @@ class ZelloController:
         self._rx_audio_seen = False
 
         self._throttle = {}             # key -> (last logged, suppressed count)
+        self._rx_blocked_sid = None     # stream cut off by RX_MAX_SEC; its audio is dropped
+        self._not_logged_in_since = None
         self._abandoned_starts = set()  # seqs of start_stream calls we gave up on
         self._tx_task = None
 
@@ -502,6 +517,16 @@ class ZelloController:
     def _check_rx_idle(self, now):
         if not self._zello_ptt.is_set() or self._last_rx_audio is None:
             return
+        if (RX_MAX_SEC > 0 and self._talk_start is not None
+                and now - self._talk_start > RX_MAX_SEC):
+            # Stuck mic / runaway stream: cut it off and ignore the rest of it
+            # (otherwise the re-assert path would simply re-key the radio).
+            self._rx_blocked_sid = self._rx_stream_id
+            self._release_rx(
+                f'RX time-out: {self._talk_user or "Unknown"} has held the channel '
+                f'for {now - self._talk_start:.0f}s; releasing the radio and '
+                'ignoring this stream', level=logging.WARNING)
+            return
         if not self._rx_audio_seen:
             # User has keyed up but not spoken yet. Allow them time to
             # start, but cap the total wait so a dead key (or a spurious
@@ -652,6 +677,19 @@ class ZelloController:
                     self._logger.warning('No logon response; closing connection to retry')
                     self._spawn(ws.close())   # a close handshake can take 10 s
             self._check_rx_idle(now)
+            if self._logged_in:
+                self._not_logged_in_since = None
+            elif self._not_logged_in_since is None:
+                self._not_logged_in_since = now
+            elif (LOGIN_WEDGE_EXIT_SEC > 0
+                    and now - self._not_logged_in_since > LOGIN_WEDGE_EXIT_SEC):
+                self._logger.critical(
+                    'Not logged in to Zello for %.0fs; exiting so the service '
+                    'manager can restart the bridge',
+                    now - self._not_logged_in_since)
+                for task in self._tasks:
+                    task.cancel()
+                await asyncio.sleep(1)   # delivers the cancel to this task too
             self._log_overruns()
             await self._maybe_reauth(now)
             # Poll fast while a Zello RX is in progress so an idle timeout
@@ -716,7 +754,10 @@ class ZelloController:
             self._set_retry_after(time.monotonic() + CHANNEL_NOT_READY_BACKOFF_SEC)
             return False
         except Exception as e:
-            self._logger.error(f'Failed to start stream: {e}')
+            self._logger.error(f'Failed to start stream: {e!r}')
+            # Without a retry window run_tx calls straight back in, and a send
+            # that raises immediately never yields to the event loop.
+            self._set_retry_after(time.monotonic() + CHANNEL_NOT_READY_BACKOFF_SEC)
             return False
 
         stream_id = reply.get('stream_id') if reply.get('success') else None
@@ -849,10 +890,7 @@ class ZelloController:
         try:
             await ws.send_bytes(frame)
         except Exception as e:
-            self._logger.error(f'Failed to start stream: {e!r}')
-            # Without a retry window run_tx calls straight back in, and a send
-            # that raises immediately never yields to the event loop.
-            self._set_retry_after(time.monotonic() + CHANNEL_NOT_READY_BACKOFF_SEC)
+            self._logger.error(f'Failed to send audio frame: {e}')
             return False
         self._frame_count += 1
         self._frame_bytes += len(opus)
@@ -1009,10 +1047,9 @@ class ZelloController:
                     else:
                         holdoff = TX_HOLDOFF_FRESH_SEC
                     if now - self._ptt_down_at < holdoff:
-                        # Debounce start_stream; discard audio so it is not
-                        # burst-sent the moment the stream opens (woodpecker).
-                        pcm_buf.clear()
-                        self._drain_input()
+                        # Debounce start_stream. Keep the audio: it is the
+                        # first syllable of the over, and sending is paced at
+                        # 20 ms per frame below, so it cannot burst-send.
                         await asyncio.sleep(0.01)
                         continue
 
@@ -1032,13 +1069,12 @@ class ZelloController:
                     if self._zello_ptt.is_set():
                         await self._end_tx()
                         continue
-                    # Fresh encoder state for this stream; drop anything that
-                    # piled up while start_stream was in flight.
+                    # Fresh encoder state for this stream. Keep whatever piled
+                    # up while start_stream was in flight (the start of the
+                    # over); the 20 ms pacing below sends it out in real time.
                     encoder = self._make_encoder()
                     sending = True
                     first_pcm_logged = False
-                    pcm_buf.clear()
-                    self._drain_input()
                     next_tx = time.monotonic()
                     last_audio_at = next_tx
                     tx_started_at = next_tx
@@ -1169,7 +1205,8 @@ class ZelloController:
         self._logger.info(f"Connecting to {self._zello_ws_endpoint}")
         async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
             ws = await asyncio.wait_for(
-                session.ws_connect(self._zello_ws_endpoint, autoping=True, heartbeat=15.0),
+                session.ws_connect(self._zello_ws_endpoint, autoping=True,
+                                   heartbeat=WS_HEARTBEAT_SEC),
                 20)
             try:
                 self._logger.debug("WebSocket connection established")
@@ -1224,6 +1261,8 @@ class ZelloController:
             _, sid, _pkt = struct.unpack_from('>bii', data, 0)
         except struct.error:
             return
+        if sid == self._rx_blocked_sid:
+            return    # runaway stream already cut off by RX_MAX_SEC
         if not self._zello_ptt.is_set():
             now = time.monotonic()
             # Re-assert case: same stream, released within RX_REASSERT_SEC.

@@ -63,6 +63,11 @@ USRP_HALF_DUPLEX = _env_bool('USRP_HALF_DUPLEX', True)
 USRP_PREBUFFER_SEC = _env_float('USRP_PREBUFFER_MS', 60) / 1000.0
 USRP_PREBUFFER_MAX_SEC = 0.15   # never hold the first frame longer than this
 
+# RF key-up lead-in: key the radio and send this much silence BEFORE the first
+# word, so the transmitter / repeater and listeners' squelch are open when
+# speech starts. 0 disables. Adds the same latency to Zello -> radio.
+USRP_PREKEY_SEC = _env_float('USRP_PREKEY_MS', 0) / 1000.0
+
 
 def db_to_linear(db):
     # Amplitude (sample) gain: 20*log10. The original used 10*log10, which is
@@ -442,6 +447,15 @@ class USRPController(asyncio.DatagramProtocol):
                            and time.monotonic() < deadline):
                         await asyncio.sleep(0.005)
                     next_tx = time.monotonic()
+
+                if not keyed and USRP_PREKEY_SEC > 0:
+                    # Lead-in: key up and hold with silence before the first
+                    # word. Zello audio keeps buffering meanwhile, nothing is lost.
+                    next_tx = time.monotonic()
+                    for _ in range(int(USRP_PREKEY_SEC / USRP_FRAME_TIME)):
+                        self._tx_frame(silence)
+                        keyed = True
+                        next_tx = await self._pace(next_tx)
 
                 pcm = bytes(buf[:USRP_VOICE_SIZE])
                 del buf[:USRP_VOICE_SIZE]
