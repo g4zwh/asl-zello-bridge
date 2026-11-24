@@ -1,8 +1,8 @@
 # AllStarLink ⇔ Zello Bridge
 
-This tool allows Zello Free or Zello Work channels to be connected to USRP, enabling bridging of amateur radio networks to the Zello network.
+** Edit: This is a branch from the creator, Matt G4IYT. I use this bridge on a daily basis and am using AI to address issues that I find in the code. I am not a coder! **
 
-_Edit: This is a branch from the creator, Matt G4IYT. I use this bridge on a daily basis and am using AI to address issues that I find in the code. I am not a coder!
+This tool allows Zello Free or Zello Work channels to be connected to USRP, enabling bridging of amateur radio networks to the Zello network.
 
 New features have been added. You will need to add extra lines to the systemmd file:
 
