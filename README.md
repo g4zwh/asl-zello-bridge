@@ -31,7 +31,34 @@ StartLimitIntervalSec=0
 ```
 ---_
 
+SUGGESTED responsive profile:
 
+# --- Reliability settings (responsive profile) ---
+
+# Dead Zello link noticed in ~7.5 s instead of ~22 s
+ZELLO_WS_HEARTBEAT_SEC=5
+
+# First reconnect after a drop (later retries still back off)
+ZELLO_RECONNECT_BASE_SEC=2
+
+# Release the Zello stream if the radio stays keyed this long (stuck squelch)
+ZELLO_TX_MAX_SEC=300
+
+# Release the radio if one Zello transmission runs this long (stuck mic)
+ZELLO_RX_MAX_SEC=300
+
+# RF key-up lead-in: silence sent before the first word of a Zello transmission.
+# Start at 200 and tune on air.
+USRP_PREKEY_MS=200
+
+# Health endpoint for monitoring (loopback only). Any free port will do.
+HEALTH_BIND=127.0.0.1
+HEALTH_PORT=8099
+
+# Self-heal: exit if not logged in to Zello for 5 minutes so systemd restarts us.
+# UNCOMMENT ONLY AFTER the unit has Restart=always, otherwise the bridge will
+# stay down after a long outage.
+#ZELLO_LOGIN_WEDGE_EXIT_SEC=300
 
 
 
